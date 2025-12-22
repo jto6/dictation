@@ -30,8 +30,16 @@ from faster_whisper import WhisperModel
 SAMPLE_RATE = 16000
 CHANNELS = 1
 MODEL_SIZE = "base.en"
-DEVICE = "cuda"  # GPU acceleration
-COMPUTE_TYPE = "float16"  # Fast on GPU
+
+# Device/compute settings - will auto-detect best configuration
+# Set to specific values to override auto-detection
+DEVICE = "auto"  # "auto", "cuda", or "cpu"
+COMPUTE_TYPE = "auto"  # "auto", "float16", "float32", "int8"
+
+# Audio input device - set to None for system default, or device name/index
+# Use `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices
+# Examples: None, 0, "pipewire", "HDA Intel PCH"
+AUDIO_DEVICE = None
 
 # Whisper prompt to bias toward technical/programming vocabulary
 INITIAL_PROMPT = """
@@ -145,6 +153,70 @@ def type_text(text: str):
             log(f"Could not type. Text: {text}")
 
 
+def detect_best_config():
+    """Auto-detect best device and compute type configuration."""
+    import ctranslate2
+
+    device = DEVICE
+    compute_type = COMPUTE_TYPE
+
+    # Determine device
+    if device == "auto":
+        if ctranslate2.get_cuda_device_count() > 0:
+            device = "cuda"
+            log("CUDA detected")
+        else:
+            device = "cpu"
+            log("No CUDA, using CPU")
+
+    # Determine compute type
+    if compute_type == "auto":
+        if device == "cpu":
+            compute_type = "int8"  # Best for CPU
+        else:
+            # For CUDA, test which compute types actually work
+            # Some GPUs/drivers have issues with float16
+            compute_type = "float16"  # Try float16 first
+
+    return device, compute_type
+
+
+def validate_model(model, device, compute_type):
+    """Quick validation that model produces sensible output."""
+    if device == "cpu":
+        return True  # CPU always works
+
+    # Generate 1 second of silence and transcribe
+    # A working model should return empty or near-empty result quickly
+    silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
+    temp_file = STATE_DIR / "validation.wav"
+
+    try:
+        sf.write(str(temp_file), silence, SAMPLE_RATE)
+        start = time.time()
+        segments, _ = model.transcribe(str(temp_file), language="en", vad_filter=False)
+        result = " ".join(seg.text for seg in segments).strip()
+        elapsed = time.time() - start
+
+        # Validation criteria:
+        # - Should complete in reasonable time (< 5s for 1s of audio)
+        # - Result should be short (silence shouldn't produce long text)
+        if elapsed > 5.0:
+            log(f"Validation failed: too slow ({elapsed:.1f}s)")
+            return False
+        if len(result) > 50:
+            log(f"Validation failed: garbage output ({len(result)} chars)")
+            return False
+
+        log(f"Validation passed ({elapsed:.2f}s)")
+        return True
+    except Exception as e:
+        log(f"Validation failed: {e}")
+        return False
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
 class DictationDaemon:
     def __init__(self):
         self.model = None
@@ -155,11 +227,45 @@ class DictationDaemon:
         self.lock = threading.Lock()
 
     def load_model(self):
-        """Load Whisper model."""
+        """Load Whisper model with auto-detection and fallback."""
         log(f"Loading Whisper model '{MODEL_SIZE}'...")
         start = time.time()
-        self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-        log(f"Model loaded in {time.time() - start:.2f}s")
+
+        device, compute_type = detect_best_config()
+
+        # Try configurations in order of preference
+        configs_to_try = []
+        if device == "cuda":
+            if compute_type == "float16":
+                configs_to_try = [
+                    ("cuda", "float16"),
+                    ("cuda", "float32"),  # Fallback for GPUs with float16 issues
+                    ("cpu", "int8"),
+                ]
+            else:
+                configs_to_try = [
+                    ("cuda", compute_type),
+                    ("cpu", "int8"),
+                ]
+        else:
+            configs_to_try = [(device, compute_type)]
+
+        for dev, ct in configs_to_try:
+            try:
+                log(f"Trying {dev}/{ct}...")
+                model = WhisperModel(MODEL_SIZE, device=dev, compute_type=ct)
+
+                if validate_model(model, dev, ct):
+                    self.model = model
+                    log(f"Model loaded in {time.time() - start:.2f}s (device={dev}, compute={ct})")
+                    return
+                else:
+                    log(f"Config {dev}/{ct} failed validation, trying next...")
+            except Exception as e:
+                log(f"Failed to load with {dev}/{ct}: {e}")
+                continue
+
+        raise RuntimeError("Could not load model with any configuration")
 
     def audio_callback(self, indata, frames, time_info, status):
         """Audio stream callback."""
@@ -179,7 +285,8 @@ class DictationDaemon:
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype=np.float32,
-                callback=self.audio_callback
+                callback=self.audio_callback,
+                device=AUDIO_DEVICE
             )
             self.stream.start()
 
