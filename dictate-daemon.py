@@ -365,6 +365,8 @@ class DictationDaemon:
         self.transcribe_queue = Queue()  # Queue for phrase transcription
         self.transcribe_thread = None
         self.last_transcribe_time = 0
+        self.pending_phrase = None   # (audio_chunks, silence_start_time) when waiting to measure pause
+        self.phrase_has_speech = False  # Whether current phrase contains actual speech
 
     def load_model(self):
         """Load Whisper model with auto-detection and fallback."""
@@ -419,14 +421,28 @@ class DictationDaemon:
             self.audio_data.append(audio_chunk)
         else:
             # Streaming mode: detect phrase boundaries via silence
-            self.phrase_audio.append(audio_chunk)
 
             # Calculate RMS energy
             rms = np.sqrt(np.mean(audio_chunk**2))
+            is_silence = rms < SILENCE_THRESHOLD
 
-            if rms < SILENCE_THRESHOLD:
+            if is_silence:
                 self.silence_samples += frames
+                # Only accumulate audio if we've had speech (don't buffer pure silence)
+                if self.phrase_has_speech:
+                    self.phrase_audio.append(audio_chunk)
             else:
+                # User is speaking
+                self.phrase_audio.append(audio_chunk)
+                self.phrase_has_speech = True
+
+                # If we had a pending phrase, queue it now that we know pause duration
+                if self.pending_phrase is not None:
+                    pending_audio, silence_start = self.pending_phrase
+                    actual_pause = time.time() - silence_start
+                    self.transcribe_queue.put((pending_audio, actual_pause))
+                    self.pending_phrase = None
+                    self.last_transcribe_time = time.time()
                 self.silence_samples = 0
 
             # Check if we've hit a phrase boundary (silence duration exceeded)
@@ -435,14 +451,24 @@ class DictationDaemon:
 
             if (silence_duration >= SILENCE_DURATION and
                 phrase_duration >= MIN_PHRASE_DURATION and
+                self.phrase_has_speech and
+                self.pending_phrase is None and
                 time.time() - self.last_transcribe_time > 0.5):
-                # Queue phrase for transcription with silence duration
-                audio_to_transcribe = self.phrase_audio[:]
+                # Mark phrase as pending - wait to see how long pause actually is
+                self.pending_phrase = (self.phrase_audio[:], time.time())
                 self.phrase_audio = []
-                actual_silence = silence_duration  # Capture before reset
+                self.phrase_has_speech = False
                 self.silence_samples = 0
-                self.last_transcribe_time = time.time()
-                self.transcribe_queue.put((audio_to_transcribe, actual_silence))
+
+            # Also check for max pause timeout (queue even if user hasn't resumed speaking)
+            # Use punctuation threshold - no benefit waiting longer since we'd strip punct anyway
+            if self.pending_phrase is not None:
+                pending_audio, silence_start = self.pending_phrase
+                pause_so_far = time.time() - silence_start
+                if pause_so_far >= PAUSE_PUNCTUATION_THRESHOLD:
+                    self.transcribe_queue.put((pending_audio, pause_so_far))
+                    self.pending_phrase = None
+                    self.last_transcribe_time = time.time()
 
     def streaming_transcribe_worker(self):
         """Background worker to transcribe phrases in streaming mode."""
@@ -507,6 +533,8 @@ class DictationDaemon:
             self.audio_data = []
             self.phrase_audio = []
             self.silence_samples = 0
+            self.pending_phrase = None
+            self.phrase_has_speech = False
             self.recording = True
 
             self.stream = sd.InputStream(
@@ -547,6 +575,13 @@ class DictationDaemon:
 
             if was_streaming:
                 # Streaming mode: queue any remaining audio and wait for worker
+                # First, handle any pending phrase
+                if self.pending_phrase is not None:
+                    pending_audio, silence_start = self.pending_phrase
+                    # End of dictation = keep punctuation
+                    self.transcribe_queue.put((pending_audio, 0))
+                    self.pending_phrase = None
+                # Then handle any audio accumulated since the pending phrase
                 if self.phrase_audio:
                     # End of dictation = keep punctuation (use low silence duration)
                     self.transcribe_queue.put((self.phrase_audio[:], 0))
@@ -626,7 +661,11 @@ class DictationDaemon:
 
             if self.recording:
                 if was_streaming and not self.streaming_mode:
-                    # Streaming → Batch: flush current phrase, stop worker
+                    # Streaming → Batch: flush pending and current phrase, stop worker
+                    if self.pending_phrase is not None:
+                        pending_audio, _ = self.pending_phrase
+                        self.transcribe_queue.put((pending_audio, PAUSE_PUNCTUATION_THRESHOLD + 1))
+                        self.pending_phrase = None
                     if self.phrase_audio:
                         # Mode switch = intentional, strip punctuation
                         self.transcribe_queue.put((self.phrase_audio[:], PAUSE_PUNCTUATION_THRESHOLD + 1))
