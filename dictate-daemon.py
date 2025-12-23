@@ -367,6 +367,7 @@ class DictationDaemon:
         self.last_transcribe_time = 0
         self.pending_phrase = None   # (audio_chunks, silence_start_time) when waiting to measure pause
         self.phrase_has_speech = False  # Whether current phrase contains actual speech
+        self.previous_text = ""        # Previous transcription for context conditioning
 
     def load_model(self):
         """Load Whisper model with auto-detection and fallback."""
@@ -499,26 +500,47 @@ class DictationDaemon:
             try:
                 sf.write(str(temp_file), audio, SAMPLE_RATE)
                 start = time.time()
+
+                # Use previous transcription as context to help Whisper understand continuity
+                # This helps it know "create" might continue with "me a picture"
+                context_prompt = INITIAL_PROMPT
+                if self.previous_text:
+                    # Append recent text (last ~100 chars) to give context
+                    recent_context = self.previous_text[-100:].strip()
+                    context_prompt = f"{INITIAL_PROMPT}\n{recent_context}"
+
                 segments, _ = self.model.transcribe(
                     str(temp_file),
                     beam_size=5,
                     language="en",
                     vad_filter=True,
-                    initial_prompt=INITIAL_PROMPT,
+                    initial_prompt=context_prompt,
+                    condition_on_previous_text=False,  # We provide context via initial_prompt instead
                 )
                 raw_text = " ".join(seg.text for seg in segments).strip()
                 text = apply_replacements(raw_text)
 
-                # Only strip punctuation for intentional pauses (longer silence)
-                # Natural speech pauses keep their punctuation
-                if silence_duration >= PAUSE_PUNCTUATION_THRESHOLD:
+                # Strip punctuation for:
+                # 1. Intentional pauses (longer silence) - user pausing to paste/think
+                # 2. Short phrases (1-2 words) - unlikely to be complete sentences
+                word_count = len(text.split())
+                should_strip = (silence_duration >= PAUSE_PUNCTUATION_THRESHOLD or
+                               word_count <= 2)
+
+                if should_strip:
                     text = strip_trailing_punctuation(text)
-                    log(f"Phrase ({duration:.1f}s, pause {silence_duration:.1f}s) transcribed in {time.time() - start:.2f}s: {text} [punct stripped]")
+                    reason = "short phrase" if word_count <= 2 else "long pause"
+                    log(f"Phrase ({duration:.1f}s, pause {silence_duration:.1f}s) transcribed in {time.time() - start:.2f}s: {text} [punct stripped: {reason}]")
                 else:
                     log(f"Phrase ({duration:.1f}s, pause {silence_duration:.1f}s) transcribed in {time.time() - start:.2f}s: {text}")
 
                 if text:
                     type_text(text + " ")  # Add space between phrases
+                    # Update context for next phrase
+                    self.previous_text = (self.previous_text + " " + text).strip()
+                    # Keep context from getting too long
+                    if len(self.previous_text) > 500:
+                        self.previous_text = self.previous_text[-300:]
             except Exception as e:
                 log(f"Phrase transcription error: {e}")
             finally:
@@ -535,6 +557,7 @@ class DictationDaemon:
             self.silence_samples = 0
             self.pending_phrase = None
             self.phrase_has_speech = False
+            self.previous_text = ""  # Reset context for new recording session
             self.recording = True
 
             self.stream = sd.InputStream(
