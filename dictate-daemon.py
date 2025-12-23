@@ -18,6 +18,7 @@ import tempfile
 import time
 import json
 import threading
+from queue import Queue, Empty
 from pathlib import Path
 from datetime import datetime
 
@@ -40,6 +41,12 @@ COMPUTE_TYPE = "auto"  # "auto", "float16", "float32", "int8"
 # Use `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices
 # Examples: None, 0, "pipewire", "HDA Intel PCH"
 AUDIO_DEVICE = None
+
+# Streaming mode settings
+SILENCE_THRESHOLD = 0.01  # RMS threshold for silence detection
+SILENCE_DURATION = 0.7    # Seconds of silence to trigger phrase transcription
+MIN_PHRASE_DURATION = 0.3 # Minimum audio duration to transcribe
+PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
 # Whisper prompt to bias toward technical/programming vocabulary
 INITIAL_PROMPT = """
@@ -107,6 +114,26 @@ def apply_replacements(text: str) -> str:
     return text
 
 
+def strip_trailing_punctuation(text: str) -> str:
+    """Strip trailing sentence-ending punctuation for streaming mode.
+
+    This prevents periods/ellipsis from being inserted when pausing mid-dictation.
+    Keeps commas and other mid-sentence punctuation.
+    """
+    # Strip trailing whitespace first
+    text = text.rstrip()
+    # Remove sentence-ending punctuation
+    while text and text[-1] in '.!?':
+        text = text[:-1]
+    # Also handle ellipsis that might be separate
+    text = text.rstrip()
+    if text.endswith('...'):
+        text = text[:-3].rstrip()
+    elif text.endswith('..'):
+        text = text[:-2].rstrip()
+    return text
+
+
 def log(message: str):
     """Log with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -129,6 +156,25 @@ def notify(message: str, urgency: str = "normal"):
         )
     except Exception:
         pass
+
+
+def play_sound(sound_name: str):
+    """Play a system sound for audio feedback."""
+    sound_path = f"/usr/share/sounds/freedesktop/stereo/{sound_name}.oga"
+    if not Path(sound_path).exists():
+        return
+
+    # Try pw-play (PipeWire), then paplay (PulseAudio), then aplay (ALSA)
+    for player in ["pw-play", "paplay", "aplay"]:
+        try:
+            subprocess.Popen(
+                [player, sound_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return
+        except FileNotFoundError:
+            continue
 
 
 def type_text(text: str):
@@ -226,6 +272,14 @@ class DictationDaemon:
         self.running = True
         self.lock = threading.Lock()
 
+        # Streaming mode state
+        self.streaming_mode = False  # False = batch mode, True = streaming mode
+        self.silence_samples = 0     # Count of consecutive silent samples
+        self.phrase_audio = []       # Audio buffer for current phrase
+        self.transcribe_queue = Queue()  # Queue for phrase transcription
+        self.transcribe_thread = None
+        self.last_transcribe_time = 0
+
     def load_model(self):
         """Load Whisper model with auto-detection and fallback."""
         log(f"Loading Whisper model '{MODEL_SIZE}'...")
@@ -269,8 +323,94 @@ class DictationDaemon:
 
     def audio_callback(self, indata, frames, time_info, status):
         """Audio stream callback."""
-        if self.recording:
-            self.audio_data.append(indata.copy())
+        if not self.recording:
+            return
+
+        audio_chunk = indata.copy()
+
+        if not self.streaming_mode:
+            # Batch mode: just accumulate audio
+            self.audio_data.append(audio_chunk)
+        else:
+            # Streaming mode: detect phrase boundaries via silence
+            self.phrase_audio.append(audio_chunk)
+
+            # Calculate RMS energy
+            rms = np.sqrt(np.mean(audio_chunk**2))
+
+            if rms < SILENCE_THRESHOLD:
+                self.silence_samples += frames
+            else:
+                self.silence_samples = 0
+
+            # Check if we've hit a phrase boundary (silence duration exceeded)
+            silence_duration = self.silence_samples / SAMPLE_RATE
+            phrase_duration = sum(len(a) for a in self.phrase_audio) / SAMPLE_RATE
+
+            if (silence_duration >= SILENCE_DURATION and
+                phrase_duration >= MIN_PHRASE_DURATION and
+                time.time() - self.last_transcribe_time > 0.5):
+                # Queue phrase for transcription with silence duration
+                audio_to_transcribe = self.phrase_audio[:]
+                self.phrase_audio = []
+                actual_silence = silence_duration  # Capture before reset
+                self.silence_samples = 0
+                self.last_transcribe_time = time.time()
+                self.transcribe_queue.put((audio_to_transcribe, actual_silence))
+
+    def streaming_transcribe_worker(self):
+        """Background worker to transcribe phrases in streaming mode."""
+        while self.recording or not self.transcribe_queue.empty():
+            try:
+                item = self.transcribe_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            # Handle both tuple (audio, silence_duration) and plain list formats
+            if isinstance(item, tuple):
+                audio_chunks, silence_duration = item
+            else:
+                audio_chunks = item
+                silence_duration = SILENCE_DURATION  # Default, keep punctuation
+
+            if not audio_chunks:
+                continue
+
+            audio = np.concatenate(audio_chunks, axis=0)
+            duration = len(audio) / SAMPLE_RATE
+
+            if duration < MIN_PHRASE_DURATION:
+                continue
+
+            # Save and transcribe
+            temp_file = STATE_DIR / f"phrase_{time.time()}.wav"
+            try:
+                sf.write(str(temp_file), audio, SAMPLE_RATE)
+                start = time.time()
+                segments, _ = self.model.transcribe(
+                    str(temp_file),
+                    beam_size=5,
+                    language="en",
+                    vad_filter=True,
+                    initial_prompt=INITIAL_PROMPT,
+                )
+                raw_text = " ".join(seg.text for seg in segments).strip()
+                text = apply_replacements(raw_text)
+
+                # Only strip punctuation for intentional pauses (longer silence)
+                # Natural speech pauses keep their punctuation
+                if silence_duration >= PAUSE_PUNCTUATION_THRESHOLD:
+                    text = strip_trailing_punctuation(text)
+                    log(f"Phrase ({duration:.1f}s, pause {silence_duration:.1f}s) transcribed in {time.time() - start:.2f}s: {text} [punct stripped]")
+                else:
+                    log(f"Phrase ({duration:.1f}s, pause {silence_duration:.1f}s) transcribed in {time.time() - start:.2f}s: {text}")
+
+                if text:
+                    type_text(text + " ")  # Add space between phrases
+            except Exception as e:
+                log(f"Phrase transcription error: {e}")
+            finally:
+                temp_file.unlink(missing_ok=True)
 
     def start_recording(self):
         """Start recording audio."""
@@ -279,6 +419,8 @@ class DictationDaemon:
                 return "Already recording"
 
             self.audio_data = []
+            self.phrase_audio = []
+            self.silence_samples = 0
             self.recording = True
 
             self.stream = sd.InputStream(
@@ -290,8 +432,17 @@ class DictationDaemon:
             )
             self.stream.start()
 
-        log("Recording started")
-        notify("🎤 Recording...", "low")
+            # Start streaming transcription worker if in streaming mode
+            if self.streaming_mode:
+                self.transcribe_thread = threading.Thread(
+                    target=self.streaming_transcribe_worker,
+                    daemon=True
+                )
+                self.transcribe_thread.start()
+
+        mode_str = "streaming" if self.streaming_mode else "batch"
+        log(f"Recording started ({mode_str} mode)")
+        notify(f"🎤 Recording ({mode_str})...", "low")
         return "Recording"
 
     def stop_recording(self) -> str:
@@ -300,6 +451,7 @@ class DictationDaemon:
             if not self.recording:
                 return "Not recording"
 
+            was_streaming = self.streaming_mode
             self.recording = False
 
             if self.stream:
@@ -307,9 +459,28 @@ class DictationDaemon:
                 self.stream.close()
                 self.stream = None
 
-            audio_data = self.audio_data
-            self.audio_data = []
+            if was_streaming:
+                # Streaming mode: queue any remaining audio and wait for worker
+                if self.phrase_audio:
+                    # End of dictation = keep punctuation (use low silence duration)
+                    self.transcribe_queue.put((self.phrase_audio[:], 0))
+                    self.phrase_audio = []
 
+                audio_data = []  # Already transcribed in real-time
+            else:
+                # Batch mode: get accumulated audio
+                audio_data = self.audio_data
+                self.audio_data = []
+
+        if was_streaming:
+            # Wait for transcription worker to finish
+            if self.transcribe_thread and self.transcribe_thread.is_alive():
+                self.transcribe_thread.join(timeout=10)
+            log("Streaming recording stopped")
+            notify("⏹️ Done", "low")
+            return "Stopped"
+
+        # Batch mode processing
         if not audio_data:
             log("No audio captured")
             return "No audio"
@@ -360,6 +531,54 @@ class DictationDaemon:
         else:
             return self.start_recording()
 
+    def toggle_mode(self) -> str:
+        """Toggle between batch and streaming mode. Can be called mid-recording."""
+        with self.lock:
+            was_streaming = self.streaming_mode
+            self.streaming_mode = not self.streaming_mode
+            mode_str = "streaming" if self.streaming_mode else "batch"
+
+            if self.recording:
+                if was_streaming and not self.streaming_mode:
+                    # Streaming → Batch: flush current phrase, stop worker
+                    if self.phrase_audio:
+                        # Mode switch = intentional, strip punctuation
+                        self.transcribe_queue.put((self.phrase_audio[:], PAUSE_PUNCTUATION_THRESHOLD + 1))
+                        self.phrase_audio = []
+                    # Signal worker to finish and wait
+                    if self.transcribe_thread and self.transcribe_thread.is_alive():
+                        # Worker will exit when queue is empty and self.recording check
+                        pass  # Let it finish naturally
+                    self.audio_data = []  # Start fresh batch accumulation
+                elif not was_streaming and self.streaming_mode:
+                    # Batch → Streaming: transcribe accumulated audio, start streaming
+                    if self.audio_data:
+                        # Queue batch audio as one phrase, mode switch = intentional pause
+                        self.transcribe_queue.put((self.audio_data[:], PAUSE_PUNCTUATION_THRESHOLD + 1))
+                        self.audio_data = []
+                    self.phrase_audio = []
+                    self.silence_samples = 0
+                    # Start streaming worker if not running
+                    if not self.transcribe_thread or not self.transcribe_thread.is_alive():
+                        self.transcribe_thread = threading.Thread(
+                            target=self.streaming_transcribe_worker,
+                            daemon=True
+                        )
+                        self.transcribe_thread.start()
+
+        log(f"Mode changed to: {mode_str}")
+        notify(f"Mode: {mode_str}", "normal")
+        # Audio feedback: different sounds for each mode
+        if self.streaming_mode:
+            play_sound("message-new-instant")  # Brighter sound for streaming
+        else:
+            play_sound("audio-volume-change")  # Subtle click for batch
+        return f"Mode: {mode_str}"
+
+    def get_mode(self) -> str:
+        """Get current mode."""
+        return "streaming" if self.streaming_mode else "batch"
+
     def handle_client(self, conn):
         """Handle a client connection."""
         try:
@@ -373,7 +592,11 @@ class DictationDaemon:
             elif data == "stop":
                 response = self.stop_recording()
             elif data == "status":
-                response = "Recording" if self.recording else "Idle"
+                mode = self.get_mode()
+                state = "Recording" if self.recording else "Idle"
+                response = f"{state} ({mode} mode)"
+            elif data == "mode":
+                response = self.toggle_mode()
             elif data == "quit":
                 self.running = False
                 response = "Shutting down"
@@ -523,6 +746,12 @@ def main():
             sys.exit(1)
         response = send_command("toggle")
         print(response)
+    elif cmd == "mode":
+        if not is_daemon_running():
+            print("Daemon not running. Start with: dictate-daemon.py start")
+            sys.exit(1)
+        response = send_command("mode")
+        print(response)
     elif cmd == "status":
         if is_daemon_running():
             response = send_command("status")
@@ -530,7 +759,7 @@ def main():
         else:
             print("Daemon not running")
     else:
-        print(f"Usage: {sys.argv[0]} [start|stop|toggle|status]")
+        print(f"Usage: {sys.argv[0]} [start|stop|toggle|mode|status]")
         sys.exit(1)
 
 

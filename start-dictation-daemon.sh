@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper to start/toggle the dictation daemon
-# Usage: start-dictation-daemon.sh [start|stop|toggle|status]
+# Usage: start-dictation-daemon.sh [start|stop|toggle|mode|status]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -19,8 +19,8 @@ fi
 # Default to toggle if no argument
 CMD="${1:-toggle}"
 
-# Auto-start daemon if toggle requested but daemon not running
-if [ "$CMD" = "toggle" ]; then
+# Auto-start daemon if toggle or mode requested but daemon not running
+if [ "$CMD" = "toggle" ] || [ "$CMD" = "mode" ]; then
     if ! python3 dictate-daemon.py status 2>/dev/null | grep -q "running"; then
         echo "Starting daemon..."
         python3 dictate-daemon.py start

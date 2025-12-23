@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup keyboard shortcut for dictation toggle on GNOME
+# Setup keyboard shortcuts for dictation on GNOME
 # Run this script on any Ubuntu/GNOME machine after installing whisper-dictation
 
 set -e
@@ -7,7 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOGGLE_SCRIPT="$SCRIPT_DIR/start-dictation-daemon.sh"
 BINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate-toggle/"
+MODE_BINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate-mode/"
 SHORTCUT="${1:-<Super>w}"
+MODE_SHORTCUT="${2:-<Super><Shift>w}"
 
 # Check if we're on GNOME
 if [[ "$XDG_CURRENT_DESKTOP" != *"GNOME"* ]]; then
@@ -26,35 +28,46 @@ if [[ ! -x "$TOGGLE_SCRIPT" ]]; then
     exit 1
 fi
 
-echo "Setting up dictation keyboard shortcut..."
+echo "Setting up dictation keyboard shortcuts..."
 echo "  Script: $TOGGLE_SCRIPT"
-echo "  Shortcut: $SHORTCUT"
+echo "  Toggle shortcut: $SHORTCUT"
+echo "  Mode shortcut: $MODE_SHORTCUT"
 echo ""
 
 # Get current custom keybindings
 current=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
 
-# Check if our binding already exists
-if [[ "$current" == *"dictate-toggle"* ]]; then
-    echo "Updating existing dictate-toggle shortcut..."
-else
-    echo "Adding new dictate-toggle shortcut..."
-    # Add our binding to the list
-    if [[ "$current" == "@as []" ]]; then
-        # No existing bindings
-        new_bindings="['$BINDING_PATH']"
-    else
-        # Append to existing bindings
-        # Remove trailing ] and add our path
-        new_bindings="${current%]*}, '$BINDING_PATH']"
-    fi
-    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$new_bindings"
-fi
+# Helper function to add a binding if it doesn't exist
+add_binding() {
+    local path="$1"
+    local current="$2"
 
-# Set the keybinding properties
+    if [[ "$current" != *"$path"* ]]; then
+        if [[ "$current" == "@as []" ]]; then
+            echo "['$path']"
+        else
+            echo "${current%]*}, '$path']"
+        fi
+    else
+        echo "$current"
+    fi
+}
+
+# Add both bindings
+echo "Setting up keyboard shortcuts..."
+current=$(add_binding "$BINDING_PATH" "$current")
+current=$(add_binding "$MODE_BINDING_PATH" "$current")
+gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$current"
+
+# Set the toggle keybinding properties
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$BINDING_PATH name "Dictate Toggle"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$BINDING_PATH command "$TOGGLE_SCRIPT toggle"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$BINDING_PATH binding "$SHORTCUT"
+
+# Set the mode keybinding properties
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH name "Dictate Mode Toggle"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH command "$TOGGLE_SCRIPT mode"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH binding "$MODE_SHORTCUT"
 
 # Setup autostart
 echo "Setting up autostart..."
@@ -72,17 +85,21 @@ echo ""
 echo "✓ Setup complete!"
 echo ""
 echo "Configured:"
-echo "  • Keyboard shortcut: $SHORTCUT"
+echo "  • Toggle shortcut: $SHORTCUT"
+echo "  • Mode shortcut: $MODE_SHORTCUT"
 echo "  • Autostart: daemon starts on login"
 echo "  • Desktop launchers: installed"
 echo ""
 echo "Usage:"
 echo "  1. Press $SHORTCUT to start recording"
 echo "  2. Speak your message"
-echo "  3. Press $SHORTCUT again to stop, transcribe, and type"
+echo "  3. Press $SHORTCUT again to stop and transcribe"
 echo ""
-echo "To use a different shortcut, run:"
-echo "  $0 '<Super>F9'    # Example: Super+F9"
-echo "  $0 '<Ctrl><Alt>d' # Example: Ctrl+Alt+D"
+echo "  Press $MODE_SHORTCUT to switch between batch and streaming modes"
+echo "    • Batch mode: transcribes all at once when stopped (more accurate)"
+echo "    • Streaming mode: transcribes phrases as you speak (more responsive)"
+echo ""
+echo "To use different shortcuts, run:"
+echo "  $0 '<Super>F9' '<Super><Shift>F9'"
 echo ""
 echo "To verify, check: Settings → Keyboard → Custom Shortcuts"
