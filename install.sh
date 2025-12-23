@@ -1,6 +1,6 @@
 #!/bin/bash
-# Full installation script for Whisper Dictation
-# Run this on a fresh machine to set up everything
+# Installation script for Whisper Dictation
+# Safe to run multiple times - will update existing installation
 
 set -e
 
@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=================================="
-echo "Whisper Dictation - Full Install"
+echo "Whisper Dictation - Install/Update"
 echo "=================================="
 echo ""
 
@@ -54,33 +54,22 @@ fi
 # Activate venv
 source venv/bin/activate
 
-# Install base dependencies
+# Install/update base dependencies
 echo ""
-echo "Installing Python dependencies..."
+echo "Installing/updating Python dependencies..."
 pip install --upgrade pip -q
-pip install faster-whisper sounddevice soundfile numpy -q
-echo "✓ Base dependencies installed"
+pip install --upgrade faster-whisper sounddevice soundfile numpy -q
+echo "✓ Base dependencies installed/updated"
 
 # Install GPU support if available
 if [ "$HAS_GPU" = true ]; then
     echo ""
-    echo "Installing GPU support (nvidia-cudnn-cu12)..."
-    pip install nvidia-cudnn-cu12 -q
+    echo "Installing/updating GPU support (nvidia-cudnn-cu12)..."
+    pip install --upgrade nvidia-cudnn-cu12 -q
     echo "✓ GPU support installed"
-
-    # Update daemon to use GPU
-    if grep -q 'DEVICE = "cpu"' dictate-daemon.py; then
-        sed -i 's/DEVICE = "cpu"/DEVICE = "cuda"/' dictate-daemon.py
-        sed -i 's/COMPUTE_TYPE = "int8"/COMPUTE_TYPE = "float16"/' dictate-daemon.py
-        echo "✓ Configured for GPU acceleration"
-    fi
+    echo "  (Device/compute type will be auto-detected at runtime)"
 else
-    # Ensure CPU mode
-    if grep -q 'DEVICE = "cuda"' dictate-daemon.py; then
-        sed -i 's/DEVICE = "cuda"/DEVICE = "cpu"/' dictate-daemon.py
-        sed -i 's/COMPUTE_TYPE = "float16"/COMPUTE_TYPE = "int8"/' dictate-daemon.py
-        echo "✓ Configured for CPU mode"
-    fi
+    echo "  (Will use CPU mode - auto-detected at runtime)"
 fi
 
 # Make scripts executable
@@ -107,6 +96,16 @@ else
     update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
 fi
 
+# Restart daemon if running (to pick up updates)
+if [ -f "/tmp/whisper-dictation/daemon.pid" ]; then
+    echo ""
+    echo "Restarting daemon to apply updates..."
+    ./start-dictation-daemon.sh stop 2>/dev/null || true
+    sleep 1
+    ./start-dictation-daemon.sh start
+    echo "✓ Daemon restarted"
+fi
+
 echo ""
 echo "=================================="
 echo "Installation complete!"
@@ -120,4 +119,4 @@ echo ""
 echo "The daemon will auto-start on login."
 echo "For manual control: $SCRIPT_DIR/start-dictation-daemon.sh [start|stop|toggle|status]"
 echo ""
-echo "See README.md for customization options."
+echo "See CLAUDE.md for configuration options."
