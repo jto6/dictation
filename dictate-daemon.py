@@ -97,6 +97,11 @@ REPLACEMENTS = {
     "- -version": "--version",
     "- -verbose": "--verbose",
     "- -force": "--force",
+    # Slash commands
+    "slash commit": "/commit",
+    "slash help": "/help",
+    "slash status": "/status",
+    "slash ": "/",  # Generic fallback for "slash X" → "/X"
 }
 
 # Paths
