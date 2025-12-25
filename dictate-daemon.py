@@ -30,10 +30,10 @@ from faster_whisper import WhisperModel
 # Configuration
 SAMPLE_RATE = 16000
 CHANNELS = 1
-MODEL_SIZE = "base.en"
 
-# Device/compute settings - will auto-detect best configuration
+# Model/device/compute settings - will auto-detect best configuration
 # Set to specific values to override auto-detection
+MODEL_SIZE = "auto"  # "auto", "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
 DEVICE = "auto"  # "auto", "cuda", or "cpu"
 COMPUTE_TYPE = "auto"  # "auto", "float16", "float32", "int8"
 
@@ -199,12 +199,67 @@ def type_text(text: str):
             log(f"Could not type. Text: {text}")
 
 
+def get_gpu_vram_mb():
+    """Get available GPU VRAM in MB using nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Get first GPU's VRAM
+            vram = int(result.stdout.strip().split('\n')[0])
+            return vram
+    except Exception:
+        pass
+    return 0
+
+
+def select_model_for_vram(vram_mb: int, device: str) -> str:
+    """Select the best Whisper model based on available VRAM.
+
+    Prefers English-only (.en) models since they're optimized for English
+    and more VRAM-efficient. The multilingual large-v3 is only ~15% better
+    than medium.en for English, but uses 2x the VRAM - not worth it unless
+    VRAM is truly abundant.
+
+    Approximate VRAM usage (float16):
+    - large-v3:  ~5GB  (1550M params, multilingual)
+    - medium.en: ~2.5GB (769M params, English-optimized)
+    - small.en:  ~1.5GB (244M params, English-optimized)
+    - base.en:   ~1GB   (74M params, English-optimized)
+
+    English Word Error Rate (lower is better):
+    - large-v3:  ~2.5%
+    - medium.en: ~2.9%
+    - small.en:  ~3.4%
+    - base.en:   ~4.3%
+    """
+    if device == "cpu":
+        # For CPU, use base.en as default (good balance of speed/quality)
+        return "base.en"
+
+    # Prefer English-optimized models. Only use large-v3 if VRAM is abundant
+    # enough that the 2x cost for 15% improvement is negligible (12GB+).
+    if vram_mb >= 12000:  # 12GB+: large-v3 worth it, plenty of headroom
+        return "large-v3"
+    elif vram_mb >= 3000:  # 3GB+: medium.en is best English model
+        return "medium.en"
+    elif vram_mb >= 2000:  # 2GB+
+        return "small.en"
+    else:
+        return "base.en"
+
+
 def detect_best_config():
-    """Auto-detect best device and compute type configuration."""
+    """Auto-detect best device, compute type, and model size configuration."""
     import ctranslate2
 
     device = DEVICE
     compute_type = COMPUTE_TYPE
+    model_size = MODEL_SIZE
 
     # Determine device
     if device == "auto":
@@ -224,7 +279,15 @@ def detect_best_config():
             # Some GPUs/drivers have issues with float16
             compute_type = "float16"  # Try float16 first
 
-    return device, compute_type
+    # Determine model size based on VRAM
+    if model_size == "auto":
+        vram_mb = get_gpu_vram_mb()
+        if vram_mb > 0:
+            log(f"GPU VRAM: {vram_mb} MB")
+        model_size = select_model_for_vram(vram_mb, device)
+        log(f"Auto-selected model: {model_size}")
+
+    return device, compute_type, model_size
 
 
 def validate_model(model, device, compute_type):
@@ -282,10 +345,10 @@ class DictationDaemon:
 
     def load_model(self):
         """Load Whisper model with auto-detection and fallback."""
-        log(f"Loading Whisper model '{MODEL_SIZE}'...")
         start = time.time()
 
-        device, compute_type = detect_best_config()
+        device, compute_type, model_size = detect_best_config()
+        log(f"Loading Whisper model '{model_size}'...")
 
         # Try configurations in order of preference
         configs_to_try = []
@@ -307,11 +370,11 @@ class DictationDaemon:
         for dev, ct in configs_to_try:
             try:
                 log(f"Trying {dev}/{ct}...")
-                model = WhisperModel(MODEL_SIZE, device=dev, compute_type=ct)
+                model = WhisperModel(model_size, device=dev, compute_type=ct)
 
                 if validate_model(model, dev, ct):
                     self.model = model
-                    log(f"Model loaded in {time.time() - start:.2f}s (device={dev}, compute={ct})")
+                    log(f"Model loaded in {time.time() - start:.2f}s (model={model_size}, device={dev}, compute={ct})")
                     return
                 else:
                     log(f"Config {dev}/{ct} failed validation, trying next...")
