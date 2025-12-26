@@ -19,16 +19,87 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# Check for xdotool
-if ! command -v xdotool &> /dev/null; then
-    echo "Warning: xdotool not found (needed for typing text)"
-    echo "Install with: sudo apt install xdotool"
-    read -p "Continue anyway? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+# Check for typing tools (ydotool for Wayland, xdotool for X11)
+SESSION_TYPE="${XDG_SESSION_TYPE:-unknown}"
+echo "Session type: $SESSION_TYPE"
+
+if [[ "$SESSION_TYPE" == "wayland" ]]; then
+    echo ""
+    echo "Wayland detected - checking for ydotool..."
+    if ! command -v ydotool &> /dev/null; then
+        echo "Warning: ydotool not found (needed for typing on Wayland)"
+        echo "Install with: sudo apt install ydotool"
+        read -p "Install ydotool now? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            sudo apt install -y ydotool
+        fi
+    fi
+
+    if command -v ydotool &> /dev/null; then
+        echo "✓ ydotool found"
+
+        # Check if ydotoold is running
+        if ! pgrep -x ydotoold > /dev/null; then
+            echo ""
+            echo "Setting up ydotool permissions..."
+
+            # Check if user is in input group
+            if ! groups | grep -q '\binput\b'; then
+                echo "Adding user to 'input' group for uinput access..."
+                sudo usermod -aG input "$USER"
+                NEED_RELOGIN=true
+            fi
+
+            # Create udev rule for uinput
+            if [ ! -f /etc/udev/rules.d/99-uinput.rules ]; then
+                echo "Creating udev rule for uinput access..."
+                echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules > /dev/null
+                sudo udevadm control --reload-rules
+                sudo udevadm trigger
+            fi
+
+            # Set up ydotoold autostart
+            echo "Setting up ydotoold autostart..."
+            mkdir -p ~/.config/autostart
+            cp "$SCRIPT_DIR/ydotoold.desktop" ~/.config/autostart/
+            echo "✓ ydotoold autostart configured"
+
+            if [ "$NEED_RELOGIN" = true ]; then
+                echo ""
+                echo "⚠ IMPORTANT: You need to log out and log back in for group membership to take effect!"
+                echo "After logging back in, ydotoold will start automatically on login."
+                echo "The dictation daemon will also start automatically."
+            else
+                # Try to start ydotoold now
+                echo "Starting ydotoold daemon..."
+                ydotoold > /dev/null 2>&1 &
+                sleep 1
+                if pgrep -x ydotoold > /dev/null; then
+                    echo "✓ ydotoold started"
+                else
+                    echo "⚠ Could not start ydotoold - it will start automatically on next login"
+                fi
+            fi
+        else
+            echo "✓ ydotoold is running"
+        fi
+    fi
+else
+    # X11 - check for xdotool
+    if ! command -v xdotool &> /dev/null; then
+        echo "Warning: xdotool not found (needed for typing text)"
+        echo "Install with: sudo apt install xdotool"
+        read -p "Continue anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    else
+        echo "✓ xdotool found"
     fi
 fi
+echo ""
 
 # Check for NVIDIA GPU
 HAS_GPU=false

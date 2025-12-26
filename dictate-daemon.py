@@ -178,25 +178,43 @@ def play_sound(sound_name: str):
 
 
 def type_text(text: str):
-    """Type text using xdotool."""
+    """Type text using ydotool (Wayland) or xdotool (X11)."""
     if not text:
         return
 
     time.sleep(0.05)  # Brief delay for focus
-    try:
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
-            check=True,
-            capture_output=True
-        )
-        log(f"Typed: {text[:50]}...")
-    except subprocess.CalledProcessError as e:
-        log(f"xdotool error: {e}")
-    except FileNotFoundError:
+
+    # Detect session type and use appropriate tool
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+
+    if session_type == "wayland":
+        # Use ydotool for Wayland
         try:
-            subprocess.run(["wtype", text], check=True, capture_output=True)
-        except Exception:
-            log(f"Could not type. Text: {text}")
+            subprocess.run(
+                ["ydotool", "type", "--", text],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+            log(f"Typed: {text[:50]}...")
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log(f"ydotool error: {e}")
+            log(f"ERROR: Could not type text on Wayland. Text: {text}")
+    else:
+        # Use xdotool for X11 (or unknown session type)
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+            log(f"Typed: {text[:50]}...")
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log(f"xdotool error: {e}")
+            log(f"ERROR: Could not type text on X11. Text: {text}")
 
 
 def get_gpu_vram_mb():

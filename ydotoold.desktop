@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=ydotoold
+Comment=ydotool daemon for Wayland input automation
+Exec=ydotoold
+Icon=input-keyboard
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=ydotool;wayland;input;automation;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
