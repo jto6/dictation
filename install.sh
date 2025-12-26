@@ -43,8 +43,12 @@ else
 fi
 echo ""
 
-# Create virtual environment
-if [ ! -d "venv" ]; then
+# Create virtual environment (or recreate if incomplete)
+if [ ! -f "venv/bin/activate" ]; then
+    if [ -d "venv" ]; then
+        echo "Removing incomplete virtual environment..."
+        rm -rf venv
+    fi
     echo "Creating virtual environment..."
     python3 -m venv venv
 else
