@@ -183,7 +183,12 @@ def play_sound(sound_name: str):
 
 
 def type_text(text: str):
-    """Type text using ydotool (Wayland) or xdotool (X11)."""
+    """Insert text using clipboard paste (more reliable than simulated typing).
+
+    Simulated typing with xdotool/ydotool can drop or reorder characters when
+    applications can't keep up with the keystroke rate. Clipboard paste is
+    atomic and much more reliable.
+    """
     if not text:
         return
 
@@ -193,33 +198,76 @@ def type_text(text: str):
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
 
     if session_type == "wayland":
-        # Use ydotool for Wayland
+        # Wayland: wl-copy + ydotool for Ctrl+V
         try:
+            # Copy text to clipboard
             subprocess.run(
-                ["ydotool", "type", "--", text],
+                ["wl-copy", "--", text],
                 check=True,
                 capture_output=True,
-                timeout=10
+                timeout=5
             )
-            log(f"Typed: {text[:50]}...")
+            time.sleep(0.02)  # Brief delay for clipboard
+            # Paste with Ctrl+V (key codes: 29=ctrl, 47=v)
+            subprocess.run(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                check=True,
+                capture_output=True,
+                timeout=5
+            )
+            log(f"Pasted: {text[:50]}...")
             return
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log(f"ydotool error: {e}")
-            log(f"ERROR: Could not type text on Wayland. Text: {text}")
+            log(f"Wayland paste error: {e}, falling back to typing")
+            # Fallback to direct typing with delay
+            try:
+                subprocess.run(
+                    ["ydotool", "type", "--key-delay", "5", "--", text],
+                    check=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                log(f"Typed (fallback): {text[:50]}...")
+                return
+            except Exception as e2:
+                log(f"ydotool fallback error: {e2}")
+                log(f"ERROR: Could not insert text on Wayland. Text: {text}")
     else:
-        # Use xdotool for X11 (or unknown session type)
+        # X11: xclip + xdotool for Ctrl+V
         try:
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
+            # Copy text to clipboard
+            proc = subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text.encode(),
                 check=True,
                 capture_output=True,
-                timeout=10
+                timeout=5
             )
-            log(f"Typed: {text[:50]}...")
+            time.sleep(0.02)  # Brief delay for clipboard
+            # Paste with Ctrl+V
+            subprocess.run(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                check=True,
+                capture_output=True,
+                timeout=5
+            )
+            log(f"Pasted: {text[:50]}...")
             return
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log(f"xdotool error: {e}")
-            log(f"ERROR: Could not type text on X11. Text: {text}")
+            log(f"X11 paste error: {e}, falling back to typing")
+            # Fallback to direct typing with delay
+            try:
+                subprocess.run(
+                    ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
+                    check=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                log(f"Typed (fallback): {text[:50]}...")
+                return
+            except Exception as e2:
+                log(f"xdotool fallback error: {e2}")
+                log(f"ERROR: Could not insert text on X11. Text: {text}")
 
 
 def get_gpu_vram_mb():

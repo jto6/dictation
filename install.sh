@@ -85,18 +85,47 @@ if [[ "$SESSION_TYPE" == "wayland" ]]; then
             echo "✓ ydotoold is running"
         fi
     fi
-else
-    # X11 - check for xdotool
-    if ! command -v xdotool &> /dev/null; then
-        echo "Warning: xdotool not found (needed for typing text)"
-        echo "Install with: sudo apt install xdotool"
-        read -p "Continue anyway? (y/n) " -n 1 -r
+    # Wayland - check for wl-clipboard (wl-copy)
+    if ! command -v wl-copy &> /dev/null; then
+        echo "Warning: wl-copy not found (needed for clipboard paste)"
+        echo "Install with: sudo apt install wl-clipboard"
+        read -p "Install wl-clipboard now? (y/n) " -n 1 -r
         echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            sudo apt install -y wl-clipboard
         fi
     else
+        echo "✓ wl-copy found"
+    fi
+else
+    # X11 - check for xdotool and xclip
+    MISSING_X11=""
+    if ! command -v xdotool &> /dev/null; then
+        MISSING_X11="xdotool"
+    fi
+    if ! command -v xclip &> /dev/null; then
+        if [ -n "$MISSING_X11" ]; then
+            MISSING_X11="$MISSING_X11 xclip"
+        else
+            MISSING_X11="xclip"
+        fi
+    fi
+
+    if [ -n "$MISSING_X11" ]; then
+        echo "Warning: Missing X11 tools: $MISSING_X11"
+        echo "Install with: sudo apt install $MISSING_X11"
+        read -p "Install now? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            sudo apt install -y $MISSING_X11
+        fi
+    fi
+
+    if command -v xdotool &> /dev/null; then
         echo "✓ xdotool found"
+    fi
+    if command -v xclip &> /dev/null; then
+        echo "✓ xclip found"
     fi
 fi
 echo ""
