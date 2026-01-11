@@ -516,6 +516,8 @@ class DictationDaemon:
                     vad_filter=True,
                     initial_prompt=context_prompt,
                     condition_on_previous_text=False,  # We provide context via initial_prompt instead
+                    repetition_penalty=1.1,  # Penalize repeated tokens
+                    no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
                 )
                 raw_text = " ".join(seg.text for seg in segments).strip()
                 text = apply_replacements(raw_text)
@@ -646,6 +648,8 @@ class DictationDaemon:
                 language="en",
                 vad_filter=True,
                 initial_prompt=INITIAL_PROMPT,
+                repetition_penalty=1.1,  # Penalize repeated tokens
+                no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
             )
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = apply_replacements(raw_text)
