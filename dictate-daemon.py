@@ -373,6 +373,14 @@ def validate_model(model, device, compute_type):
 
     try:
         sf.write(str(temp_file), silence, SAMPLE_RATE)
+
+        # Warm-up pass: CUDA/cuDNN compiles optimized kernels on first run,
+        # which can take several seconds. Run once untimed to trigger JIT
+        # compilation before the actual validation.
+        log(f"Warming up {device}/{compute_type}...")
+        list(model.transcribe(str(temp_file), language="en", vad_filter=False)[0])
+
+        # Now run the timed validation
         start = time.time()
         segments, _ = model.transcribe(str(temp_file), language="en", vad_filter=False)
         result = " ".join(seg.text for seg in segments).strip()
