@@ -182,12 +182,40 @@ def play_sound(sound_name: str):
             continue
 
 
+# Maximum characters to paste in one chunk to avoid terminal buffer issues
+PASTE_CHUNK_SIZE = 500
+
+
+def reset_modifier_keys():
+    """Reset modifier keys to prevent stuck Ctrl/Alt/Shift states."""
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    try:
+        if session_type == "wayland":
+            # Release all modifiers via ydotool (29=ctrl, 42=shift, 56=alt)
+            subprocess.run(
+                ["ydotool", "key", "29:0", "42:0", "56:0"],
+                capture_output=True,
+                timeout=2
+            )
+        else:
+            # X11: use xdotool keyup for all modifiers
+            subprocess.run(
+                ["xdotool", "keyup", "ctrl", "shift", "alt", "super"],
+                capture_output=True,
+                timeout=2
+            )
+    except Exception:
+        pass  # Best effort
+
+
 def type_text(text: str):
     """Insert text using clipboard paste (more reliable than simulated typing).
 
     Simulated typing with xdotool/ydotool can drop or reorder characters when
     applications can't keep up with the keystroke rate. Clipboard paste is
     atomic and much more reliable.
+
+    For very long text, paste in chunks to avoid terminal buffer issues.
     """
     if not text:
         return
@@ -197,77 +225,124 @@ def type_text(text: str):
     # Detect session type and use appropriate tool
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
 
-    if session_type == "wayland":
-        # Wayland: wl-copy + ydotool for Ctrl+V
-        try:
-            # Copy text to clipboard
-            subprocess.run(
-                ["wl-copy", "--", text],
-                check=True,
-                capture_output=True,
-                timeout=5
-            )
-            time.sleep(0.02)  # Brief delay for clipboard
-            # Paste with Ctrl+V (key codes: 29=ctrl, 47=v)
-            subprocess.run(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                check=True,
-                capture_output=True,
-                timeout=5
-            )
-            log(f"Pasted: {text[:50]}...")
-            return
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log(f"Wayland paste error: {e}, falling back to typing")
-            # Fallback to direct typing with delay
-            try:
-                subprocess.run(
-                    ["ydotool", "type", "--key-delay", "5", "--", text],
-                    check=True,
-                    capture_output=True,
-                    timeout=30
-                )
-                log(f"Typed (fallback): {text[:50]}...")
-                return
-            except Exception as e2:
-                log(f"ydotool fallback error: {e2}")
-                log(f"ERROR: Could not insert text on Wayland. Text: {text}")
+    # Split into chunks for long text to avoid overwhelming terminals
+    if len(text) > PASTE_CHUNK_SIZE:
+        chunks = []
+        remaining = text
+        while remaining:
+            # Try to break at word boundary within chunk size
+            if len(remaining) <= PASTE_CHUNK_SIZE:
+                chunks.append(remaining)
+                break
+            # Find last space within chunk size
+            chunk = remaining[:PASTE_CHUNK_SIZE]
+            last_space = chunk.rfind(' ')
+            if last_space > PASTE_CHUNK_SIZE // 2:
+                # Break at word boundary
+                chunks.append(remaining[:last_space + 1])
+                remaining = remaining[last_space + 1:]
+            else:
+                # No good word boundary, just break at chunk size
+                chunks.append(chunk)
+                remaining = remaining[PASTE_CHUNK_SIZE:]
+        log(f"Splitting {len(text)} chars into {len(chunks)} chunks")
     else:
-        # X11: xclip + xdotool for Ctrl+V
+        chunks = [text]
+
+    for i, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+
         try:
-            # Copy text to clipboard
-            proc = subprocess.run(
-                ["xclip", "-selection", "clipboard"],
-                input=text.encode(),
-                check=True,
-                capture_output=True,
-                timeout=5
-            )
-            time.sleep(0.02)  # Brief delay for clipboard
-            # Paste with Ctrl+V
-            subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                check=True,
-                capture_output=True,
-                timeout=5
-            )
-            log(f"Pasted: {text[:50]}...")
+            if session_type == "wayland":
+                _paste_wayland(chunk)
+            else:
+                _paste_x11(chunk)
+
+            if len(chunks) > 1 and i < len(chunks) - 1:
+                # Delay between chunks to let terminal process
+                time.sleep(0.1)
+        except Exception as e:
+            log(f"Paste error on chunk {i+1}/{len(chunks)}: {e}")
+            reset_modifier_keys()
             return
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log(f"X11 paste error: {e}, falling back to typing")
-            # Fallback to direct typing with delay
-            try:
-                subprocess.run(
-                    ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
-                    check=True,
-                    capture_output=True,
-                    timeout=30
-                )
-                log(f"Typed (fallback): {text[:50]}...")
-                return
-            except Exception as e2:
-                log(f"xdotool fallback error: {e2}")
-                log(f"ERROR: Could not insert text on X11. Text: {text}")
+
+    # Always reset modifier keys after pasting to prevent stuck state
+    reset_modifier_keys()
+
+    if len(text) > 50:
+        log(f"Pasted: {text[:50]}... ({len(text)} chars)")
+    else:
+        log(f"Pasted: {text}")
+
+
+def _paste_wayland(text: str):
+    """Paste text on Wayland using wl-copy + ydotool."""
+    try:
+        # Copy text to clipboard
+        subprocess.run(
+            ["wl-copy", "--", text],
+            check=True,
+            capture_output=True,
+            timeout=5
+        )
+        time.sleep(0.02)  # Brief delay for clipboard
+        # Paste with Ctrl+V (key codes: 29=ctrl, 47=v)
+        subprocess.run(
+            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+            check=True,
+            capture_output=True,
+            timeout=5
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"Wayland paste error: {e}, falling back to typing")
+        # Fallback to direct typing with delay
+        try:
+            subprocess.run(
+                ["ydotool", "type", "--key-delay", "5", "--", text],
+                check=True,
+                capture_output=True,
+                timeout=30
+            )
+            log(f"Typed (fallback): {text[:50]}...")
+        except Exception as e2:
+            log(f"ydotool fallback error: {e2}")
+            raise
+
+
+def _paste_x11(text: str):
+    """Paste text on X11 using xclip + xdotool."""
+    try:
+        # Copy text to clipboard
+        subprocess.run(
+            ["xclip", "-selection", "clipboard"],
+            input=text.encode(),
+            check=True,
+            capture_output=True,
+            timeout=5
+        )
+        time.sleep(0.02)  # Brief delay for clipboard
+        # Paste with Ctrl+V
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            check=True,
+            capture_output=True,
+            timeout=5
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"X11 paste error: {e}, falling back to typing")
+        # Fallback to direct typing with delay
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
+                check=True,
+                capture_output=True,
+                timeout=30
+            )
+            log(f"Typed (fallback): {text[:50]}...")
+        except Exception as e2:
+            log(f"xdotool fallback error: {e2}")
+            raise
 
 
 def get_gpu_vram_mb():
