@@ -282,72 +282,47 @@ def type_text(text: str):
 
 
 def _paste_wayland(text: str):
-    """Paste text on Wayland using wl-copy + ydotool."""
+    """Type text on Wayland using ydotool simulated keystrokes.
+
+    Direct typing works universally across all applications.
+    """
     try:
-        # Copy text to clipboard
         subprocess.run(
-            ["wl-copy", "--", text],
+            ["ydotool", "type", "--key-delay", "10", "--", text],
             check=True,
-            capture_output=True,
-            timeout=5
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60
         )
-        time.sleep(0.02)  # Brief delay for clipboard
-        # Paste with Ctrl+V (key codes: 29=ctrl, 47=v)
-        subprocess.run(
-            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-            check=True,
-            capture_output=True,
-            timeout=5
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f"Wayland paste error: {e}, falling back to typing")
-        # Fallback to direct typing with delay
-        try:
-            subprocess.run(
-                ["ydotool", "type", "--key-delay", "5", "--", text],
-                check=True,
-                capture_output=True,
-                timeout=30
-            )
-            log(f"Typed (fallback): {text[:50]}...")
-        except Exception as e2:
-            log(f"ydotool fallback error: {e2}")
-            raise
+    except subprocess.TimeoutExpired:
+        log(f"ydotool type timed out for {len(text)} chars")
+        raise
+    except Exception as e:
+        log(f"ydotool type error: {e}")
+        raise
 
 
 def _paste_x11(text: str):
-    """Paste text on X11 using xclip + xdotool."""
+    """Type text on X11 using xdotool simulated keystrokes.
+
+    Direct typing works universally across all applications (terminals, Emacs,
+    browsers, etc.) unlike clipboard paste which requires Ctrl+V support.
+    The delay between keystrokes prevents character dropping in applications
+    that can't keep up with rapid input.
+    """
     try:
-        # Copy text to clipboard
         subprocess.run(
-            ["xclip", "-selection", "clipboard"],
-            input=text.encode(),
+            ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
             check=True,
             capture_output=True,
-            timeout=5
+            timeout=60
         )
-        time.sleep(0.02)  # Brief delay for clipboard
-        # Paste with Ctrl+V
-        subprocess.run(
-            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-            check=True,
-            capture_output=True,
-            timeout=5
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f"X11 paste error: {e}, falling back to typing")
-        # Fallback to direct typing with delay
-        try:
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
-                check=True,
-                capture_output=True,
-                timeout=30
-            )
-            log(f"Typed (fallback): {text[:50]}...")
-        except Exception as e2:
-            log(f"xdotool fallback error: {e2}")
-            raise
+    except subprocess.TimeoutExpired:
+        log(f"xdotool type timed out for {len(text)} chars")
+        raise
+    except Exception as e:
+        log(f"xdotool type error: {e}")
+        raise
 
 
 def get_gpu_vram_mb():
