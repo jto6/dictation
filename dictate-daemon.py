@@ -143,10 +143,15 @@ def log(message: str):
     """Log with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     log_line = f"[{timestamp}] {message}"
+    # When running as daemon, stdout is redirected to LOG_FILE, so just print.
+    # Only write directly to file when stdout is NOT already the log file
+    # (i.e., when running in foreground for debugging).
     print(log_line, flush=True)
+    # Check if stdout is redirected to the log file (daemon mode)
     try:
-        with open(LOG_FILE, "a") as f:
-            f.write(log_line + "\n")
+        if not hasattr(sys.stdout, 'name') or sys.stdout.name != str(LOG_FILE):
+            with open(LOG_FILE, "a") as f:
+                f.write(log_line + "\n")
     except Exception:
         pass
 
