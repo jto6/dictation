@@ -188,7 +188,7 @@ def play_sound(sound_name: str):
 
 
 # Maximum characters to paste in one chunk to avoid terminal buffer issues
-PASTE_CHUNK_SIZE = 500
+PASTE_CHUNK_SIZE = 300
 
 
 def reset_modifier_keys():
@@ -266,7 +266,7 @@ def type_text(text: str):
 
             if len(chunks) > 1 and i < len(chunks) - 1:
                 # Delay between chunks to let terminal process
-                time.sleep(0.1)
+                time.sleep(0.15)
         except Exception as e:
             log(f"Paste error on chunk {i+1}/{len(chunks)}: {e}")
             reset_modifier_keys()
@@ -312,7 +312,7 @@ def _paste_x11(text: str):
     """
     try:
         subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
+            ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
             check=True,
             capture_output=True,
             timeout=60
