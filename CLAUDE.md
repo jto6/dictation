@@ -19,12 +19,12 @@ Alternative modes (less commonly used):
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `dictate-daemon.py` | Main daemon - handles recording, transcription, typing |
-| `start-dictation-daemon.sh` | Wrapper that activates venv and sets up library paths |
-| `install.sh` | Full installation script - creates venv, installs deps, sets up shortcuts |
-| `setup-shortcut.sh` | GNOME-specific keyboard shortcut and autostart setup |
+| File                        | Purpose                                                                   |
+|-----------------------------|---------------------------------------------------------------------------|
+| `dictate-daemon.py`         | Main daemon - handles recording, transcription, typing                    |
+| `start-dictation-daemon.sh` | Wrapper that activates venv and sets up library paths                     |
+| `install.sh`                | Full installation script - creates venv, installs deps, sets up shortcuts |
+| `setup-shortcut.sh`         | GNOME-specific keyboard shortcut and autostart setup                      |
 
 ## Configuration
 
