@@ -628,6 +628,8 @@ class DictationDaemon:
 
         if not self.streaming_mode:
             # Batch mode: just accumulate audio
+            if len(self.audio_data) == 0:
+                log("First audio chunk received")
             self.audio_data.append(audio_chunk)
         else:
             # Streaming mode: detect phrase boundaries via silence
@@ -791,18 +793,21 @@ class DictationDaemon:
                 self.transcribe_thread.start()
 
         mode_str = "streaming" if self.streaming_mode else "batch"
+        self.recording_start_time = time.time()
         log(f"Recording started ({mode_str} mode)")
         notify(f"🎤 Recording ({mode_str})...", "low")
         return "Recording"
 
     def stop_recording(self) -> str:
         """Stop recording and transcribe."""
+        log("Stop recording requested")
         with self.lock:
             if not self.recording:
                 return "Not recording"
 
             was_streaming = self.streaming_mode
             self.recording = False
+            log("Recording flag set to False")
 
             if self.stream:
                 self.stream.stop()
@@ -844,7 +849,8 @@ class DictationDaemon:
 
         audio = np.concatenate(audio_data, axis=0)
         duration = len(audio) / SAMPLE_RATE
-        log(f"Captured {duration:.1f}s of audio")
+        elapsed = time.time() - self.recording_start_time if hasattr(self, 'recording_start_time') else 0
+        log(f"Captured {duration:.1f}s of audio (wall clock: {elapsed:.1f}s, chunks: {len(audio_data)})")
 
         notify("⏹️ Transcribing...", "low")
 

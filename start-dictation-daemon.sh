@@ -19,6 +19,10 @@ fi
 # Default to toggle if no argument
 CMD="${1:-toggle}"
 
+# Log every invocation for debugging
+LOG_FILE="/tmp/whisper-dictation/daemon.log"
+echo "[$(date '+%H:%M:%S.%3N')] Wrapper invoked: $CMD" >> "$LOG_FILE"
+
 # Auto-start daemon if toggle or mode requested but daemon not running
 if [ "$CMD" = "toggle" ] || [ "$CMD" = "mode" ]; then
     if ! python3 dictate-daemon.py status 2>/dev/null | grep -q "running"; then
