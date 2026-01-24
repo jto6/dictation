@@ -104,6 +104,32 @@ REPLACEMENTS = {
     "slash ": "/",  # Generic fallback for "slash X" → "/X"
 }
 
+# Common Whisper hallucinations (typically appear at end of transcription)
+# These are artifacts from YouTube training data
+HALLUCINATIONS = [
+    "Thank you for watching!",
+    "Thank you for watching.",
+    "Thanks for watching!",
+    "Thanks for watching.",
+    "Thank you for listening!",
+    "Thank you for listening.",
+    "Thanks for listening!",
+    "Thanks for listening.",
+    "Please subscribe!",
+    "Please subscribe.",
+    "Don't forget to subscribe!",
+    "Don't forget to subscribe.",
+    "Like and subscribe!",
+    "Like and subscribe.",
+    "See you in the next video!",
+    "See you in the next video.",
+    "See you next time!",
+    "See you next time.",
+    "Bye!",
+    "Bye bye!",
+    "Bye-bye!",
+]
+
 # Paths
 STATE_DIR = Path("/tmp/whisper-dictation")
 SOCKET_PATH = STATE_DIR / "daemon.sock"
@@ -116,6 +142,18 @@ def apply_replacements(text: str) -> str:
     """Apply post-processing replacements to fix common transcription errors."""
     for wrong, correct in REPLACEMENTS.items():
         text = text.replace(wrong, correct)
+    return text
+
+
+def strip_hallucinations(text: str) -> str:
+    """Remove common Whisper hallucinations from the end of transcriptions."""
+    original = text
+    for phrase in HALLUCINATIONS:
+        # Check if text ends with this hallucination (with optional trailing whitespace)
+        if text.rstrip().endswith(phrase):
+            text = text.rstrip()[:-len(phrase)].rstrip()
+    if text != original:
+        log(f"Stripped hallucination: '{original[len(text):].strip()}'")
     return text
 
 
@@ -685,6 +723,7 @@ class DictationDaemon:
                     beam_size=5,
                     language="en",
                     vad_filter=True,
+                    hallucination_silence_threshold=0.5,  # Skip segments during detected silence
                     initial_prompt=context_prompt,
                     condition_on_previous_text=False,  # We provide context via initial_prompt instead
                     repetition_penalty=1.1,  # Penalize repeated tokens
@@ -692,6 +731,7 @@ class DictationDaemon:
                 )
                 raw_text = " ".join(seg.text for seg in segments).strip()
                 text = apply_replacements(raw_text)
+                text = strip_hallucinations(text)
 
                 # Strip punctuation for:
                 # 1. Intentional pauses (longer silence) - user pausing to paste/think
@@ -818,12 +858,14 @@ class DictationDaemon:
                 beam_size=5,
                 language="en",
                 vad_filter=True,
+                hallucination_silence_threshold=0.5,  # Skip segments during detected silence
                 initial_prompt=INITIAL_PROMPT,
                 repetition_penalty=1.1,  # Penalize repeated tokens
                 no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
             )
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = apply_replacements(raw_text)
+            text = strip_hallucinations(text)
             elapsed = time.time() - start
             if text != raw_text:
                 log(f"Transcribed in {elapsed:.2f}s: {raw_text} → {text}")
