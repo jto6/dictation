@@ -326,21 +326,40 @@ def _paste_x11(text: str):
 
 
 def get_gpu_vram_mb():
-    """Get available GPU VRAM in MB using nvidia-smi."""
+    """Get total and available GPU VRAM in MB using nvidia-smi.
+
+    Returns:
+        tuple: (total_mb, available_mb) - both 0 if query fails
+    """
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=5
         )
         if result.returncode == 0:
-            # Get first GPU's VRAM
-            vram = int(result.stdout.strip().split('\n')[0])
-            return vram
+            # Get first GPU's VRAM (format: "total, free")
+            parts = result.stdout.strip().split('\n')[0].split(',')
+            total = int(parts[0].strip())
+            free = int(parts[1].strip())
+            return total, free
     except Exception:
         pass
-    return 0
+    return 0, 0
+
+
+# Model hierarchy from largest to smallest (for fallback)
+MODEL_HIERARCHY = ["large-v3", "medium.en", "small.en", "base.en", "tiny.en"]
+
+# Approximate VRAM requirements in MB (float16)
+MODEL_VRAM_REQUIREMENTS = {
+    "large-v3": 5000,   # ~5GB
+    "medium.en": 2500,  # ~2.5GB
+    "small.en": 1500,   # ~1.5GB
+    "base.en": 1000,    # ~1GB
+    "tiny.en": 500,     # ~0.5GB
+}
 
 
 def select_model_for_vram(vram_mb: int, device: str) -> str:
@@ -367,16 +386,32 @@ def select_model_for_vram(vram_mb: int, device: str) -> str:
         # For CPU, use base.en as default (good balance of speed/quality)
         return "base.en"
 
-    # Prefer English-optimized models. Only use large-v3 if VRAM is abundant
-    # enough that the 2x cost for 15% improvement is negligible (12GB+).
-    if vram_mb >= 12000:  # 12GB+: large-v3 worth it, plenty of headroom
+    # Thresholds based on available VRAM with ~1.5x headroom for inference buffers
+    # Model requirements: large-v3 ~5GB, medium.en ~2.5GB, small.en ~1.5GB, base.en ~1GB
+    if vram_mb >= 7000:   # 7GB+: large-v3 (5GB + headroom)
         return "large-v3"
-    elif vram_mb >= 3000:  # 3GB+: medium.en is best English model
+    elif vram_mb >= 4000:  # 4GB+: medium.en (2.5GB + headroom)
         return "medium.en"
-    elif vram_mb >= 2000:  # 2GB+
+    elif vram_mb >= 2500:  # 2.5GB+: small.en (1.5GB + headroom)
         return "small.en"
-    else:
+    elif vram_mb >= 1500:  # 1.5GB+: base.en (1GB + headroom)
         return "base.en"
+    else:
+        return "tiny.en"
+
+
+def get_model_fallback_chain(starting_model: str) -> list:
+    """Get list of models to try, starting from given model down to smallest.
+
+    Returns models from starting_model down through the hierarchy,
+    allowing graceful degradation when VRAM is tight.
+    """
+    try:
+        start_idx = MODEL_HIERARCHY.index(starting_model)
+        return MODEL_HIERARCHY[start_idx:]
+    except ValueError:
+        # Unknown model, just return it alone
+        return [starting_model]
 
 
 def detect_best_config():
@@ -405,12 +440,13 @@ def detect_best_config():
             # Some GPUs/drivers have issues with float16
             compute_type = "float16"  # Try float16 first
 
-    # Determine model size based on VRAM
+    # Determine model size based on available VRAM (not total)
     if model_size == "auto":
-        vram_mb = get_gpu_vram_mb()
-        if vram_mb > 0:
-            log(f"GPU VRAM: {vram_mb} MB")
-        model_size = select_model_for_vram(vram_mb, device)
+        total_vram, available_vram = get_gpu_vram_mb()
+        if total_vram > 0:
+            log(f"GPU VRAM: {available_vram} MB available / {total_vram} MB total")
+        # Use available VRAM for model selection, not total
+        model_size = select_model_for_vram(available_vram, device)
         log(f"Auto-selected model: {model_size}")
 
     return device, compute_type, model_size
@@ -481,43 +517,67 @@ class DictationDaemon:
         self.previous_text = ""        # Previous transcription for context conditioning
 
     def load_model(self):
-        """Load Whisper model with auto-detection and fallback."""
+        """Load Whisper model with auto-detection and fallback.
+
+        Fallback strategy:
+        1. Start with model selected based on available VRAM
+        2. Try float16, then float32 for that model on CUDA
+        3. If both fail (likely OOM), try the next smaller model on CUDA
+        4. Repeat until base.en is tried
+        5. Only fall back to CPU as last resort
+        """
         start = time.time()
 
         device, compute_type, model_size = detect_best_config()
         log(f"Loading Whisper model '{model_size}'...")
 
-        # Try configurations in order of preference
-        configs_to_try = []
         if device == "cuda":
-            if compute_type == "float16":
-                configs_to_try = [
-                    ("cuda", "float16"),
-                    ("cuda", "float32"),  # Fallback for GPUs with float16 issues
-                    ("cpu", "int8"),
-                ]
-            else:
-                configs_to_try = [
-                    ("cuda", compute_type),
-                    ("cpu", "int8"),
-                ]
-        else:
-            configs_to_try = [(device, compute_type)]
+            # Build fallback chain: try progressively smaller models on GPU
+            # before falling back to CPU
+            model_chain = get_model_fallback_chain(model_size)
 
-        for dev, ct in configs_to_try:
+            for model_name in model_chain:
+                # For each model, try float16 then float32
+                for ct in ["float16", "float32"]:
+                    try:
+                        log(f"Trying {model_name} on cuda/{ct}...")
+                        model = WhisperModel(model_name, device="cuda", compute_type=ct)
+
+                        if validate_model(model, "cuda", ct):
+                            self.model = model
+                            log(f"Model loaded in {time.time() - start:.2f}s (model={model_name}, device=cuda, compute={ct})")
+                            return
+                        else:
+                            log(f"Config cuda/{ct} failed validation, trying next...")
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "out of memory" in error_msg or "oom" in error_msg:
+                            log(f"CUDA OOM with {model_name}/{ct}, trying smaller model...")
+                            break  # Skip float32, go straight to smaller model
+                        log(f"Failed to load {model_name} with cuda/{ct}: {e}")
+                        continue
+
+            # All CUDA attempts failed, fall back to CPU
+            log("All CUDA configurations failed, falling back to CPU...")
             try:
-                log(f"Trying {dev}/{ct}...")
-                model = WhisperModel(model_size, device=dev, compute_type=ct)
-
-                if validate_model(model, dev, ct):
+                # Use base.en for CPU (good speed/quality balance)
+                model = WhisperModel("base.en", device="cpu", compute_type="int8")
+                if validate_model(model, "cpu", "int8"):
                     self.model = model
-                    log(f"Model loaded in {time.time() - start:.2f}s (model={model_size}, device={dev}, compute={ct})")
+                    log(f"Model loaded in {time.time() - start:.2f}s (model=base.en, device=cpu, compute=int8)")
                     return
-                else:
-                    log(f"Config {dev}/{ct} failed validation, trying next...")
             except Exception as e:
-                log(f"Failed to load with {dev}/{ct}: {e}")
-                continue
+                log(f"CPU fallback failed: {e}")
+        else:
+            # CPU mode - just try the requested configuration
+            try:
+                model = WhisperModel(model_size, device=device, compute_type=compute_type)
+                if validate_model(model, device, compute_type):
+                    self.model = model
+                    log(f"Model loaded in {time.time() - start:.2f}s (model={model_size}, device={device}, compute={compute_type})")
+                    return
+            except Exception as e:
+                log(f"Failed to load model: {e}")
 
         raise RuntimeError("Could not load model with any configuration")
 
