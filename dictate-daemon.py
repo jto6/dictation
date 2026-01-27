@@ -157,23 +157,36 @@ def strip_hallucinations(text: str) -> str:
     return text
 
 
+def strip_trailing_ellipsis(text: str) -> str:
+    """Strip trailing ellipsis that Whisper adds for incomplete sentences.
+
+    Whisper adds '...' when it detects speech was cut off mid-sentence.
+    This is unwanted when pausing dictation to paste text manually.
+    Always called after transcription regardless of mode.
+    """
+    text = text.rstrip()
+    if text.endswith('...'):
+        text = text[:-3].rstrip()
+    elif text.endswith('..'):
+        text = text[:-2].rstrip()
+    # Also handle Unicode ellipsis character (…)
+    elif text.endswith('…'):
+        text = text[:-1].rstrip()
+    return text
+
+
 def strip_trailing_punctuation(text: str) -> str:
     """Strip trailing sentence-ending punctuation for streaming mode.
 
-    This prevents periods/ellipsis from being inserted when pausing mid-dictation.
+    This prevents periods from being inserted when pausing mid-dictation.
     Keeps commas and other mid-sentence punctuation.
+    Note: Ellipsis is handled separately by strip_trailing_ellipsis().
     """
     # Strip trailing whitespace first
     text = text.rstrip()
     # Remove sentence-ending punctuation
     while text and text[-1] in '.!?':
         text = text[:-1]
-    # Also handle ellipsis that might be separate
-    text = text.rstrip()
-    if text.endswith('...'):
-        text = text[:-3].rstrip()
-    elif text.endswith('..'):
-        text = text[:-2].rstrip()
     return text
 
 
@@ -734,6 +747,7 @@ class DictationDaemon:
                 raw_text = " ".join(seg.text for seg in segments).strip()
                 text = apply_replacements(raw_text)
                 text = strip_hallucinations(text)
+                text = strip_trailing_ellipsis(text)
 
                 # Strip punctuation for:
                 # 1. Intentional pauses (longer silence) - user pausing to paste/think
@@ -872,6 +886,7 @@ class DictationDaemon:
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = apply_replacements(raw_text)
             text = strip_hallucinations(text)
+            text = strip_trailing_ellipsis(text)
             elapsed = time.time() - start
             if text != raw_text:
                 log(f"Transcribed in {elapsed:.2f}s: {raw_text} → {text}")
