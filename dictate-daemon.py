@@ -445,7 +445,7 @@ def select_model_for_vram(vram_mb: int, device: str) -> str:
 
     # Thresholds based on available VRAM with ~1.5x headroom for inference buffers
     # Model requirements: large-v3 ~5GB, medium.en ~2.5GB, small.en ~1.5GB, base.en ~1GB
-    if vram_mb >= 7000:   # 7GB+: large-v3 (5GB + headroom)
+    if vram_mb >= 13000:   # 13GB+: only try if VRAM is excessive! large-v3 (5GB + headroom)
         return "large-v3"
     elif vram_mb >= 4000:  # 4GB+: medium.en (2.5GB + headroom)
         return "medium.en"
