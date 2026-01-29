@@ -10,6 +10,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import socket
 import signal
@@ -136,6 +137,11 @@ SOCKET_PATH = STATE_DIR / "daemon.sock"
 PID_FILE = STATE_DIR / "daemon.pid"
 LOG_FILE = STATE_DIR / "daemon.log"
 AUDIO_FILE = STATE_DIR / "recording.wav"
+
+
+def normalize_whitespace(text: str) -> str:
+    """Collapse multiple spaces into single spaces."""
+    return re.sub(r' {2,}', ' ', text)
 
 
 def apply_replacements(text: str) -> str:
@@ -745,7 +751,8 @@ class DictationDaemon:
                     no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
                 )
                 raw_text = " ".join(seg.text for seg in segments).strip()
-                text = apply_replacements(raw_text)
+                text = normalize_whitespace(raw_text)
+                text = apply_replacements(text)
                 text = strip_hallucinations(text)
                 text = strip_trailing_ellipsis(text)
 
@@ -884,7 +891,8 @@ class DictationDaemon:
                 no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
             )
             raw_text = " ".join(seg.text for seg in segments).strip()
-            text = apply_replacements(raw_text)
+            text = normalize_whitespace(raw_text)
+            text = apply_replacements(text)
             text = strip_hallucinations(text)
             text = strip_trailing_ellipsis(text)
             elapsed = time.time() - start
