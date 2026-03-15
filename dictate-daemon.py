@@ -137,6 +137,7 @@ SOCKET_PATH = STATE_DIR / "daemon.sock"
 PID_FILE = STATE_DIR / "daemon.pid"
 LOG_FILE = STATE_DIR / "daemon.log"
 AUDIO_FILE = STATE_DIR / "recording.wav"
+LAST_AUDIO_FILE = STATE_DIR / "last-recording.wav"
 
 
 def normalize_whitespace(text: str) -> str:
@@ -903,7 +904,7 @@ class DictationDaemon:
             log(f"Transcription error: {e}")
             text = ""
         finally:
-            AUDIO_FILE.unlink(missing_ok=True)
+            AUDIO_FILE.rename(LAST_AUDIO_FILE)
 
         if text:
             notify(f"✓ {text[:40]}..." if len(text) > 40 else f"✓ {text}", "low")
