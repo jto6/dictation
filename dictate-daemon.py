@@ -744,7 +744,6 @@ class DictationDaemon:
                     beam_size=5,
                     language="en",
                     vad_filter=True,
-                    hallucination_silence_threshold=0.5,  # Skip segments during detected silence
                     initial_prompt=context_prompt,
                     condition_on_previous_text=False,  # We provide context via initial_prompt instead
                     repetition_penalty=1.1,  # Penalize repeated tokens
@@ -884,12 +883,12 @@ class DictationDaemon:
                 str(AUDIO_FILE),
                 beam_size=5,
                 language="en",
-                vad_filter=True,
-                hallucination_silence_threshold=0.5,  # Skip segments during detected silence
+                vad_filter=False,  # Don't discard any audio - user intentionally started recording
                 initial_prompt=INITIAL_PROMPT,
-                repetition_penalty=1.1,  # Penalize repeated tokens
-                no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
             )
+            segments = list(segments)
+            if segments:
+                log(f"Segments: {len(segments)}, last ends at {segments[-1].end:.1f}s (audio: {duration:.1f}s)")
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = normalize_whitespace(raw_text)
             text = apply_replacements(text)
