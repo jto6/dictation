@@ -103,6 +103,8 @@ REPLACEMENTS = {
     "slash help": "/help",
     "slash status": "/status",
     "slash ": "/",  # Generic fallback for "slash X" → "/X"
+    "npack": "NPAC",
+    "SDV plus": "SDV+"
 }
 
 # Common Whisper hallucinations (typically appear at end of transcription)
@@ -147,8 +149,9 @@ def normalize_whitespace(text: str) -> str:
 
 def apply_replacements(text: str) -> str:
     """Apply post-processing replacements to fix common transcription errors."""
+    import re
     for wrong, correct in REPLACEMENTS.items():
-        text = text.replace(wrong, correct)
+        text = re.sub(re.escape(wrong), correct, text, flags=re.IGNORECASE)
     return text
 
 
