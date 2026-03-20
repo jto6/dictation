@@ -170,18 +170,13 @@ def strip_hallucinations(text: str) -> str:
 def strip_trailing_ellipsis(text: str) -> str:
     """Strip trailing ellipsis that Whisper adds for incomplete sentences.
 
-    Whisper adds '...' when it detects speech was cut off mid-sentence.
-    This is unwanted when pausing dictation to paste text manually.
+    Whisper adds '...' when it detects speech was cut off mid-sentence, or
+    hallucinates repeated '...' patterns during trailing silence.
     Always called after transcription regardless of mode.
     """
-    text = text.rstrip()
-    if text.endswith('...'):
-        text = text[:-3].rstrip()
-    elif text.endswith('..'):
-        text = text[:-2].rstrip()
-    # Also handle Unicode ellipsis character (…)
-    elif text.endswith('…'):
-        text = text[:-1].rstrip()
+    import re
+    # Strip any number of trailing ellipsis patterns (ASCII or Unicode), space-separated or not
+    text = re.sub(r'(\s*(\.\.\.|\.\.|…))+\s*$', '', text)
     return text
 
 
