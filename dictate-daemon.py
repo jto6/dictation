@@ -131,6 +131,11 @@ HALLUCINATIONS = [
     "Bye!",
     "Bye bye!",
     "Bye-bye!",
+    "Thank you very much.",
+    "Thank you very much!",
+    "Thank you.",
+    "Thank you!",
+    "That's all for today.",
 ]
 
 # Paths
@@ -158,10 +163,13 @@ def apply_replacements(text: str) -> str:
 def strip_hallucinations(text: str) -> str:
     """Remove common Whisper hallucinations from the end of transcriptions."""
     original = text
-    for phrase in HALLUCINATIONS:
-        # Check if text ends with this hallucination (with optional trailing whitespace)
-        if text.rstrip().endswith(phrase):
-            text = text.rstrip()[:-len(phrase)].rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for phrase in HALLUCINATIONS:
+            if text.rstrip().endswith(phrase):
+                text = text.rstrip()[:-len(phrase)].rstrip()
+                changed = True
     if text != original:
         log(f"Stripped hallucination: '{original[len(text):].strip()}'")
     return text
@@ -884,6 +892,8 @@ class DictationDaemon:
                 language="en",
                 vad_filter=False,  # Don't discard any audio - user intentionally started recording
                 initial_prompt=INITIAL_PROMPT,
+                word_timestamps=True,  # Prevents skipping speech in long segments
+                hallucination_silence_threshold=1.0,  # Filter hallucinations in trailing silence
             )
             segments = list(segments)
             if segments:
