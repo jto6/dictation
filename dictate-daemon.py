@@ -894,6 +894,8 @@ class DictationDaemon:
                 initial_prompt=INITIAL_PROMPT,
                 word_timestamps=True,  # Prevents skipping speech in long segments
                 hallucination_silence_threshold=1.0,  # Filter hallucinations in trailing silence
+                repetition_penalty=1.1,   # Penalize repeated tokens
+                no_repeat_ngram_size=3,   # Prevent 3-gram repetitions (blocks hallucination loops)
             )
             segments = list(segments)
             if segments:
