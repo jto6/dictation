@@ -109,34 +109,24 @@ REPLACEMENTS = {
 
 # Common Whisper hallucinations (typically appear at end of transcription)
 # These are artifacts from YouTube training data
-HALLUCINATIONS = [
-    "Thank you for watching!",
-    "Thank you for watching.",
-    "Thanks for watching!",
-    "Thanks for watching.",
-    "Thank you for listening!",
-    "Thank you for listening.",
-    "Thanks for listening!",
-    "Thanks for listening.",
-    "Please subscribe!",
-    "Please subscribe.",
-    "Don't forget to subscribe!",
-    "Don't forget to subscribe.",
-    "Like and subscribe!",
-    "Like and subscribe.",
-    "See you in the next video!",
-    "See you in the next video.",
-    "See you next time!",
-    "See you next time.",
-    "Bye!",
-    "Bye bye!",
-    "Bye-bye!",
-    "Thank you very much.",
-    "Thank you very much!",
-    "Thank you.",
-    "Thank you!",
-    "That's all for today.",
+# Common Whisper hallucination patterns (typically at end of transcription).
+# These are regex patterns matched case-insensitively against the end of the text.
+# Each pattern can optionally match trailing filler like ", and have a great day."
+_HALLUCINATION_TAIL = r"(?:[,.!]?\s*and\s+.{0,40})?[.!]?"
+HALLUCINATION_PATTERNS = [
+    r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+watching" + _HALLUCINATION_TAIL,
+    r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+listening" + _HALLUCINATION_TAIL,
+    r"(?:please\s+)?(?:don'?t\s+forget\s+to\s+)?(?:like\s+and\s+)?subscribe" + _HALLUCINATION_TAIL,
+    r"see\s+you\s+(?:in\s+the\s+)?next\s+(?:video|time|one)" + _HALLUCINATION_TAIL,
+    r"bye[\s-]*bye" + _HALLUCINATION_TAIL,
+    r"bye[.!]?",
+    r"thank\s+you\s+very\s+much" + _HALLUCINATION_TAIL,
+    r"thank\s+you" + _HALLUCINATION_TAIL,
+    r"that'?s\s+all\s+for\s+(?:today|now)" + _HALLUCINATION_TAIL,
+    r"i'?ll\s+see\s+you\s+(?:in\s+the\s+)?next\s+(?:video|one)" + _HALLUCINATION_TAIL,
+    r"have\s+a\s+(?:great|good|nice|wonderful)\s+(?:day|one)" + _HALLUCINATION_TAIL,
 ]
+_HALLUCINATION_RE = [re.compile(p + r"\s*$", re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
 
 # Paths
 STATE_DIR = Path("/tmp/whisper-dictation")
@@ -166,9 +156,10 @@ def strip_hallucinations(text: str) -> str:
     changed = True
     while changed:
         changed = False
-        for phrase in HALLUCINATIONS:
-            if text.rstrip().endswith(phrase):
-                text = text.rstrip()[:-len(phrase)].rstrip()
+        for pattern in _HALLUCINATION_RE:
+            m = pattern.search(text)
+            if m:
+                text = text[:m.start()].rstrip()
                 changed = True
     if text != original:
         log(f"Stripped hallucination: '{original[len(text):].strip()}'")
@@ -893,13 +884,19 @@ class DictationDaemon:
                 vad_filter=False,  # Don't discard any audio - user intentionally started recording
                 initial_prompt=INITIAL_PROMPT,
                 word_timestamps=True,  # Prevents skipping speech in long segments
-                hallucination_silence_threshold=1.0,  # Filter hallucinations in trailing silence
+                hallucination_silence_threshold=None,  # Disabled: was dropping real speech after pauses
                 repetition_penalty=1.1,   # Penalize repeated tokens
                 no_repeat_ngram_size=3,   # Prevent 3-gram repetitions (blocks hallucination loops)
             )
             segments = list(segments)
             if segments:
                 log(f"Segments: {len(segments)}, last ends at {segments[-1].end:.1f}s (audio: {duration:.1f}s)")
+                prev_end = 0.0
+                for i, seg in enumerate(segments):
+                    gap = seg.start - prev_end
+                    gap_flag = f" [GAP {gap:.1f}s]" if gap > 0.5 else ""
+                    log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag} {seg.text.strip()[:80]}")
+                    prev_end = seg.end
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = normalize_whitespace(raw_text)
             text = apply_replacements(text)
