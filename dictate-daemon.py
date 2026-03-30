@@ -122,7 +122,10 @@ HALLUCINATION_PATTERNS = [
     r"bye[.!]?",
     r"thank\s+you\s+very\s+much" + _HALLUCINATION_TAIL,
     r"thank\s+you" + _HALLUCINATION_TAIL,
+    r"and\s+that'?s\s+it" + _HALLUCINATION_TAIL,
+    r"that'?s\s+it" + _HALLUCINATION_TAIL,
     r"that'?s\s+all\s+for\s+(?:today|now)" + _HALLUCINATION_TAIL,
+    r"that'?s\s+all" + _HALLUCINATION_TAIL,
     r"i'?ll\s+see\s+you\s+(?:in\s+the\s+)?next\s+(?:video|one)" + _HALLUCINATION_TAIL,
     r"have\s+a\s+(?:great|good|nice|wonderful)\s+(?:day|one)" + _HALLUCINATION_TAIL,
 ]
@@ -897,6 +900,20 @@ class DictationDaemon:
                     gap_flag = f" [GAP {gap:.1f}s]" if gap > 0.5 else ""
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
+                # Drop trailing segments after long silence gaps (hallucinations from dead air)
+                SILENCE_GAP_THRESHOLD = 12.0  # seconds
+                prev_end = 0.0
+                trim_idx = None
+                for i, seg in enumerate(segments):
+                    gap = seg.start - prev_end
+                    if i > 0 and gap >= SILENCE_GAP_THRESHOLD:
+                        trim_idx = i
+                        break
+                    prev_end = seg.end
+                if trim_idx is not None:
+                    dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
+                    log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {gap:.1f}s silence gap: '{dropped}'")
+                    segments = segments[:trim_idx]
             raw_text = " ".join(seg.text for seg in segments).strip()
             text = normalize_whitespace(raw_text)
             text = apply_replacements(text)
