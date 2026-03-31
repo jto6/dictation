@@ -117,19 +117,20 @@ HALLUCINATION_PATTERNS = [
     r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+watching" + _HALLUCINATION_TAIL,
     r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+listening" + _HALLUCINATION_TAIL,
     r"(?:please\s+)?(?:don'?t\s+forget\s+to\s+)?(?:like\s+and\s+)?subscribe" + _HALLUCINATION_TAIL,
-    r"see\s+you\s+(?:in\s+the\s+)?next\s+(?:video|time|one)" + _HALLUCINATION_TAIL,
-    r"bye[\s-]*bye" + _HALLUCINATION_TAIL,
-    r"bye[.!]?",
+    r"see\s+you(?:\s+\w+){0,2}\s+(?:in\s+the\s+)?next\s+(?:video|time|one)" + _HALLUCINATION_TAIL,
+    r"\bbye[\s-]*bye" + _HALLUCINATION_TAIL,
+    r"\bbye[.!]?",
+    r"thank\s+you\s+for\s+(?:your\s+)?\w+(?:\s+\w+){0,1}" + r"[.!]?",
     r"thank\s+you\s+very\s+much" + _HALLUCINATION_TAIL,
     r"thank\s+you" + _HALLUCINATION_TAIL,
     r"and\s+that'?s\s+it" + _HALLUCINATION_TAIL,
     r"that'?s\s+it" + _HALLUCINATION_TAIL,
     r"that'?s\s+all\s+for\s+(?:today|now)" + _HALLUCINATION_TAIL,
     r"that'?s\s+all" + _HALLUCINATION_TAIL,
-    r"i'?ll\s+see\s+you\s+(?:in\s+the\s+)?next\s+(?:video|one)" + _HALLUCINATION_TAIL,
+    r"i'?ll\s+see\s+you(?:\s+\w+){0,2}\s+(?:in\s+the\s+)?next\s+(?:video|one)" + _HALLUCINATION_TAIL,
     r"have\s+a\s+(?:great|good|nice|wonderful)\s+(?:day|one)" + _HALLUCINATION_TAIL,
 ]
-_HALLUCINATION_RE = [re.compile(p + r"\s*$", re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
+_HALLUCINATION_RE = [re.compile(p + r"[\s.]*$", re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
 
 # Paths
 STATE_DIR = Path("/tmp/whisper-dictation")
@@ -164,6 +165,8 @@ def strip_hallucinations(text: str) -> str:
             if m:
                 text = text[:m.start()].rstrip()
                 changed = True
+    # Strip trailing conjunctions/connectors left dangling after hallucination removal
+    text = re.sub(r'\s+(?:and|so|but|or|now|well)\s*$', '', text, flags=re.IGNORECASE)
     if text != original:
         log(f"Stripped hallucination: '{original[len(text):].strip()}'")
     return text
