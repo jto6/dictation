@@ -146,6 +146,51 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
+def remove_segment_overlaps(seg_texts: list) -> list:
+    """Remove content repeated across adjacent segment boundaries.
+
+    Whisper sometimes ends a segment mid-phrase and repeats the tail words at
+    the start of the next segment.  For each consecutive pair we find the
+    longest suffix of seg[i] (up to 8 words) that matches the prefix of
+    seg[i+1] and strip that prefix.
+    """
+    def norm_words(text):
+        """Return list of (normalized, original_token) for each word."""
+        result = []
+        for tok in text.split():
+            w = re.sub(r'[^\w]', '', tok.lower())
+            if w:
+                result.append((w, tok))
+        return result
+
+    result = list(seg_texts)
+    for i in range(len(result) - 1):
+        prev = norm_words(result[i])
+        nxt  = norm_words(result[i + 1])
+        if not prev or not nxt:
+            continue
+        max_check = min(len(prev), len(nxt), 8)
+        overlap = 0
+        for k in range(max_check, 2, -1):
+            if [w for w, _ in prev[-k:]] == [w for w, _ in nxt[:k]]:
+                overlap = k
+                break
+        if overlap:
+            # Skip the first `overlap` word-tokens in result[i+1]
+            tokens = result[i + 1].split()
+            consumed, skip = 0, 0
+            for tok in tokens:
+                skip += 1
+                if re.sub(r'[^\w]', '', tok.lower()):
+                    consumed += 1
+                if consumed >= overlap:
+                    break
+            trimmed = ' '.join(tokens[skip:]).lstrip(' ,.')
+            log(f"Removed cross-segment overlap ({overlap} words): dropped '{' '.join(tokens[:skip])}'")
+            result[i + 1] = trimmed
+    return result
+
+
 def apply_replacements(text: str) -> str:
     """Apply post-processing replacements to fix common transcription errors."""
     import re
@@ -917,7 +962,8 @@ class DictationDaemon:
                     dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
                     log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {gap:.1f}s silence gap: '{dropped}'")
                     segments = segments[:trim_idx]
-            raw_text = " ".join(seg.text for seg in segments).strip()
+            seg_texts = remove_segment_overlaps([seg.text for seg in segments])
+            raw_text = " ".join(seg_texts).strip()
             text = normalize_whitespace(raw_text)
             text = apply_replacements(text)
             text = strip_hallucinations(text)
