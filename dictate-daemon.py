@@ -948,19 +948,28 @@ class DictationDaemon:
                     gap_flag = f" [GAP {gap:.1f}s]" if gap > 0.5 else ""
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
-                # Drop trailing segments after long silence gaps (hallucinations from dead air)
-                SILENCE_GAP_THRESHOLD = 12.0  # seconds
+                # Drop trailing segments after long silence gaps (hallucinations from dead air).
+                # Only drop if the remaining speech is short - a long gap mid-dictation is just
+                # the user pausing to think, not dead air generating hallucinations.
+                SILENCE_GAP_THRESHOLD = 12.0   # seconds
+                MAX_TRAILING_SPEECH = 20.0     # don't drop if > this many seconds of speech follow the gap
                 prev_end = 0.0
                 trim_idx = None
+                trim_gap = 0.0
                 for i, seg in enumerate(segments):
                     gap = seg.start - prev_end
                     if i > 0 and gap >= SILENCE_GAP_THRESHOLD:
-                        trim_idx = i
-                        break
+                        trailing_duration = segments[-1].end - seg.start
+                        if trailing_duration <= MAX_TRAILING_SPEECH:
+                            trim_idx = i
+                            trim_gap = gap
+                            break
+                        else:
+                            log(f"Skipping silence gap filter: {gap:.1f}s gap at seg {i} but {trailing_duration:.1f}s of speech follows")
                     prev_end = seg.end
                 if trim_idx is not None:
                     dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
-                    log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {gap:.1f}s silence gap: '{dropped}'")
+                    log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {trim_gap:.1f}s silence gap: '{dropped}'")
                     segments = segments[:trim_idx]
             seg_texts = remove_segment_overlaps([seg.text for seg in segments])
             raw_text = " ".join(seg_texts).strip()
