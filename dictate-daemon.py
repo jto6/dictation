@@ -146,6 +146,37 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
+def drop_trailing_echo(segments: list) -> list:
+    """Drop the final segment if it's a fuzzy echo of the previous segment's tail.
+
+    Whisper sometimes hallucinates a short trailing segment that echoes the
+    end of the main transcription with slight word variations (e.g., "4th"
+    becomes "3rd").  These are too different for exact overlap removal but
+    are clearly not real speech.
+
+    Heuristic: if the last segment is short (< 3s) and > 60% of its unique
+    words appear in the last 12 words of the previous segment, drop it.
+    """
+    if len(segments) < 2:
+        return segments
+    last = segments[-1]
+    prev = segments[-2]
+    # Only consider short trailing segments
+    if (last.end - last.start) > 3.0:
+        return segments
+    def norm_words(text):
+        return [re.sub(r'[^\w]', '', w.lower()) for w in text.split() if re.sub(r'[^\w]', '', w.lower())]
+    last_words = set(norm_words(last.text))
+    prev_tail = set(norm_words(prev.text)[-12:])
+    if not last_words:
+        return segments
+    overlap_ratio = len(last_words & prev_tail) / len(last_words)
+    if overlap_ratio >= 0.6:
+        log(f"Dropped trailing echo segment ({overlap_ratio:.0%} word overlap): '{last.text.strip()}'")
+        return segments[:-1]
+    return segments
+
+
 def remove_segment_overlaps(seg_texts: list) -> list:
     """Remove content repeated across adjacent segment boundaries.
 
@@ -969,6 +1000,7 @@ class DictationDaemon:
                     dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
                     log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {trim_gap:.1f}s silence gap: '{dropped}'")
                     segments = segments[:trim_idx]
+            segments = drop_trailing_echo(segments)
             seg_texts = remove_segment_overlaps([seg.text for seg in segments])
             raw_text = " ".join(seg_texts).strip()
             text = normalize_whitespace(raw_text)
