@@ -418,50 +418,85 @@ def type_text(text: str):
         log(f"Pasted: {text}")
 
 
-def _paste_wayland(text: str):
-    """Paste text on Wayland using clipboard (wl-copy + Ctrl+Shift+V, fallback to ydotool type).
-
-    Clipboard paste is atomic and avoids PTY buffer overflow that occurs when
-    ydotool type simulates keystrokes faster than the terminal can process them.
-    Falls back to ydotool type if wl-copy is not available.
-    """
+def _is_terminal_focused_wayland():
+    """Check if the focused Wayland window is a terminal emulator."""
     try:
-        # Save current clipboard
-        saved = subprocess.run(
-            ["wl-paste", "--no-newline"],
-            capture_output=True, timeout=2
+        # swaymsg works on sway; other compositors may need different approaches
+        result = subprocess.run(
+            ["swaymsg", "-t", "get_tree"],
+            capture_output=True, text=True, timeout=2
         )
-        saved_clip = saved.stdout if saved.returncode == 0 else None
+        if result.returncode == 0:
+            import json
+            tree = json.loads(result.stdout)
+            def find_focused(node):
+                if node.get("focused"):
+                    return node.get("app_id", "").lower()
+                for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                    found = find_focused(child)
+                    if found is not None:
+                        return found
+                return None
+            app_id = find_focused(tree)
+            if app_id:
+                terminals = {
+                    "ghostty", "gnome-terminal", "gnome-terminal-server",
+                    "xterm", "urxvt", "alacritty", "kitty", "konsole",
+                    "terminator", "tilix", "xfce4-terminal", "lxterminal",
+                    "st", "foot", "wezterm", "rio", "contour",
+                }
+                return app_id in terminals
+    except Exception:
+        pass
+    return False
 
-        # Set clipboard to our text
-        subprocess.run(
-            ["wl-copy", "--", text],
-            check=True, capture_output=True, timeout=2
-        )
 
-        # Paste with Ctrl+Shift+V
-        subprocess.run(
-            ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
-        )
+def _paste_wayland(text: str):
+    """Paste text on Wayland, using clipboard paste for terminals and ydotool type otherwise.
 
-        # Brief delay to let paste complete before restoring clipboard
-        time.sleep(0.1)
-
-        # Restore previous clipboard
-        if saved_clip is not None:
-            subprocess.run(
-                ["wl-copy", "--", saved_clip.decode("utf-8", errors="replace")],
+    Terminals are susceptible to PTY buffer overflow when ydotool type simulates
+    keystrokes faster than they can process. Clipboard paste (Ctrl+Shift+V) is
+    atomic and avoids this. Other apps (Emacs, browsers, etc.) handle simulated
+    keystrokes fine, and some don't support Ctrl+Shift+V.
+    """
+    if _is_terminal_focused_wayland():
+        try:
+            # Save current clipboard
+            saved = subprocess.run(
+                ["wl-paste", "--no-newline"],
                 capture_output=True, timeout=2
             )
+            saved_clip = saved.stdout if saved.returncode == 0 else None
 
-        return
-    except FileNotFoundError:
-        log("wl-copy/wl-paste not found, falling back to ydotool type")
-    except Exception as e:
-        log(f"Clipboard paste failed ({e}), falling back to ydotool type")
+            # Set clipboard to our text
+            subprocess.run(
+                ["wl-copy", "--", text],
+                check=True, capture_output=True, timeout=2
+            )
 
-    # Fallback: simulated keystrokes (slower, can overwhelm terminal buffers)
+            # Paste with Ctrl+Shift+V
+            subprocess.run(
+                ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+
+            # Brief delay to let paste complete before restoring clipboard
+            time.sleep(0.1)
+
+            # Restore previous clipboard
+            if saved_clip is not None:
+                subprocess.run(
+                    ["wl-copy", "--", saved_clip.decode("utf-8", errors="replace")],
+                    capture_output=True, timeout=2
+                )
+
+            return
+        except FileNotFoundError:
+            log("wl-copy/wl-paste not found, falling back to ydotool type")
+        except Exception as e:
+            log(f"Clipboard paste failed ({e}), falling back to ydotool type")
+
+    # Simulated keystrokes — works universally (Emacs, browsers, etc.)
     try:
         subprocess.run(
             ["ydotool", "type", "--key-delay", "10", "--", text],
@@ -478,73 +513,94 @@ def _paste_wayland(text: str):
         raise
 
 
-def _paste_x11(text: str):
-    """Paste text on X11 using clipboard (Ctrl+Shift+V with xclip fallback to xdotool type).
-
-    Clipboard paste is atomic and avoids PTY buffer overflow that occurs when
-    xdotool type simulates keystrokes faster than the terminal can process them.
-    Falls back to xdotool type for applications that don't support Ctrl+Shift+V.
-    """
-    # Save current clipboard, set new content, paste, restore
-    xclip_proc = None
+def _is_terminal_focused_x11():
+    """Check if the focused X11 window is a terminal emulator."""
     try:
-        # Save current clipboard
-        saved = subprocess.run(
-            ["xclip", "-selection", "clipboard", "-o"],
-            capture_output=True, timeout=2
+        result = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowclassname"],
+            capture_output=True, text=True, timeout=2
         )
-        saved_clip = saved.stdout if saved.returncode == 0 else None
+        if result.returncode == 0:
+            wm_class = result.stdout.strip().lower()
+            terminals = {
+                "ghostty", "gnome-terminal", "gnome-terminal-server",
+                "xterm", "urxvt", "alacritty", "kitty", "konsole",
+                "terminator", "tilix", "xfce4-terminal", "lxterminal",
+                "st", "foot", "wezterm", "rio", "contour", "cool-retro-term",
+            }
+            return wm_class in terminals
+    except Exception:
+        pass
+    return False
 
-        # Set clipboard to our text. xclip forks and stays alive to serve the
-        # X11 selection protocol, so we must not wait for it to exit.
-        xclip_proc = subprocess.Popen(
-            ["xclip", "-selection", "clipboard"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        xclip_proc.stdin.write(text.encode("utf-8"))
-        xclip_proc.stdin.close()
 
-        # Small delay to let xclip register as the clipboard owner
-        time.sleep(0.05)
+def _paste_x11(text: str):
+    """Paste text on X11, using clipboard paste for terminals and xdotool type otherwise.
 
-        # Paste with Ctrl+Shift+V
-        subprocess.run(
-            ["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
-            check=True, capture_output=True, timeout=5
-        )
-
-        # Brief delay to let paste complete before restoring clipboard
-        time.sleep(0.1)
-
-        # Kill the xclip process (it would run forever otherwise)
-        xclip_proc.terminate()
-        xclip_proc.wait(timeout=1)
+    Terminals are susceptible to PTY buffer overflow when xdotool type simulates
+    keystrokes faster than they can process. Clipboard paste (Ctrl+Shift+V) is
+    atomic and avoids this. Other apps (Emacs, browsers, etc.) handle simulated
+    keystrokes fine, and some don't support Ctrl+Shift+V.
+    """
+    if _is_terminal_focused_x11():
         xclip_proc = None
+        try:
+            # Save current clipboard
+            saved = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                capture_output=True, timeout=2
+            )
+            saved_clip = saved.stdout if saved.returncode == 0 else None
 
-        # Restore previous clipboard
-        if saved_clip is not None:
-            restore_proc = subprocess.Popen(
+            # Set clipboard to our text. xclip forks and stays alive to serve
+            # the X11 selection protocol, so we must not wait for it to exit.
+            xclip_proc = subprocess.Popen(
                 ["xclip", "-selection", "clipboard"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            restore_proc.stdin.write(saved_clip)
-            restore_proc.stdin.close()
-            # Let the restore process run in the background
+            xclip_proc.stdin.write(text.encode("utf-8"))
+            xclip_proc.stdin.close()
 
-        return
-    except FileNotFoundError:
-        log("xclip not found, falling back to xdotool type")
-    except Exception as e:
-        log(f"Clipboard paste failed ({e}), falling back to xdotool type")
-    finally:
-        if xclip_proc is not None:
+            # Small delay to let xclip register as the clipboard owner
+            time.sleep(0.05)
+
+            # Paste with Ctrl+Shift+V
+            subprocess.run(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
+                check=True, capture_output=True, timeout=5
+            )
+
+            # Brief delay to let paste complete before restoring clipboard
+            time.sleep(0.1)
+
+            # Kill the xclip process (it would run forever otherwise)
             xclip_proc.terminate()
+            xclip_proc.wait(timeout=1)
+            xclip_proc = None
 
-    # Fallback: simulated keystrokes (slower, can overwhelm terminal buffers)
+            # Restore previous clipboard
+            if saved_clip is not None:
+                restore_proc = subprocess.Popen(
+                    ["xclip", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                restore_proc.stdin.write(saved_clip)
+                restore_proc.stdin.close()
+
+            return
+        except FileNotFoundError:
+            log("xclip not found, falling back to xdotool type")
+        except Exception as e:
+            log(f"Clipboard paste failed ({e}), falling back to xdotool type")
+        finally:
+            if xclip_proc is not None:
+                xclip_proc.terminate()
+
+    # Simulated keystrokes — works universally (Emacs, browsers, etc.)
     try:
         subprocess.run(
             ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
