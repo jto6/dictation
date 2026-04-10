@@ -185,8 +185,12 @@ def remove_segment_overlaps(seg_texts: list) -> list:
 
     Whisper sometimes ends a segment mid-phrase and repeats the tail words at
     the start of the next segment.  For each consecutive pair we find the
-    longest suffix of seg[i] (up to 8 words) that matches the prefix of
+    longest suffix of seg[i] (up to 30 words) that matches the prefix of
     seg[i+1] and strip that prefix.
+
+    Also handles the case where an entire segment is a duplicate of content
+    already present in the previous segment (Whisper occasionally re-emits a
+    full sentence when the audio has trailing silence).
     """
     def norm_words(text):
         """Return list of (normalized, original_token) for each word."""
@@ -203,7 +207,16 @@ def remove_segment_overlaps(seg_texts: list) -> list:
         nxt  = norm_words(result[i + 1])
         if not prev or not nxt:
             continue
-        max_check = min(len(prev), len(nxt), 8)
+
+        # Check if nxt is entirely contained at the end of prev (full duplicate).
+        nxt_words = [w for w, _ in nxt]
+        prev_words = [w for w, _ in prev]
+        if nxt_words == prev_words[-len(nxt_words):]:
+            log(f"Removed duplicate segment ({len(nxt_words)} words): '{result[i + 1].strip()}'")
+            result[i + 1] = ''
+            continue
+
+        max_check = min(len(prev), len(nxt), 30)
         overlap = 0
         for k in range(max_check, 2, -1):
             if [w for w, _ in prev[-k:]] == [w for w, _ in nxt[:k]]:
