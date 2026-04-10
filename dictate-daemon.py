@@ -1159,7 +1159,11 @@ class DictationDaemon:
                     gap = seg.start - prev_end
                     if i > 0 and gap >= SILENCE_GAP_THRESHOLD:
                         trailing_duration = segments[-1].end - seg.start
-                        if trailing_duration <= MAX_TRAILING_SPEECH:
+                        prev_text = segments[i - 1].text.strip()
+                        prev_ends_mid_sentence = prev_text and prev_text[-1] not in '.!?'
+                        if prev_ends_mid_sentence:
+                            log(f"Skipping silence gap filter: {gap:.1f}s gap at seg {i} but previous segment is mid-sentence")
+                        elif trailing_duration <= MAX_TRAILING_SPEECH:
                             trim_idx = i
                             trim_gap = gap
                             break
@@ -1170,6 +1174,22 @@ class DictationDaemon:
                     dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
                     log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {trim_gap:.1f}s silence gap: '{dropped}'")
                     segments = segments[:trim_idx]
+            # Drop segments where word rate is physically impossible (Whisper hallucination).
+            # Normal max speech is ~5 words/sec; hallucinated filler appears at 8-15 words/sec.
+            # Only apply to segments with >=3 words to avoid false positives on short real utterances.
+            MAX_WORDS_PER_SEC = 6.0
+            MIN_WORDS_FOR_RATE_CHECK = 3
+            filtered_segments = []
+            for seg in segments:
+                duration = seg.end - seg.start
+                words = len(seg.text.split())
+                if duration > 0 and words >= MIN_WORDS_FOR_RATE_CHECK:
+                    rate = words / duration
+                    if rate > MAX_WORDS_PER_SEC:
+                        log(f"Dropped implausible segment ({rate:.1f} words/sec, {duration:.1f}s): '{seg.text.strip()}'")
+                        continue
+                filtered_segments.append(seg)
+            segments = filtered_segments
             segments = drop_trailing_echo(segments)
             seg_texts = remove_segment_overlaps([seg.text for seg in segments])
             raw_text = " ".join(seg_texts).strip()
