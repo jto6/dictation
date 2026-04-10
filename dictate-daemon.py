@@ -115,6 +115,7 @@ REPLACEMENTS = {
 _HALLUCINATION_TAIL = r"(?:[,.!]?\s*and\s+.{0,40})?[.!]?"
 HALLUCINATION_PATTERNS = [
     r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+watching" + _HALLUCINATION_TAIL,
+    r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+(?:reading|viewing)" + _HALLUCINATION_TAIL,
     r"thanks?\s+(?:you\s+)?(?:so much\s+)?for\s+listening" + _HALLUCINATION_TAIL,
     r"(?:please\s+)?(?:don'?t\s+forget\s+to\s+)?(?:like\s+and\s+)?subscribe" + _HALLUCINATION_TAIL,
     r"see\s+you(?:\s+\w+){0,2}\s+(?:in\s+the\s+)?next\s+(?:video|time|one)" + _HALLUCINATION_TAIL,
@@ -129,6 +130,8 @@ HALLUCINATION_PATTERNS = [
     r"that'?s\s+all" + _HALLUCINATION_TAIL,
     r"i'?ll\s+see\s+you(?:\s+\w+){0,2}\s+(?:in\s+the\s+)?next\s+(?:video|one)" + _HALLUCINATION_TAIL,
     r"have\s+a\s+(?:great|good|nice|wonderful)\s+(?:day|one)" + _HALLUCINATION_TAIL,
+    r"(?:in\s+the\s+)?description\s+(?:of\s+this\s+|below\s+)?video" + _HALLUCINATION_TAIL,
+    r"(?:check\s+(?:out\s+)?)?(?:the\s+)?links?\s+in\s+the\s+description" + _HALLUCINATION_TAIL,
 ]
 _HALLUCINATION_RE = [re.compile(p + r"[\s.]*$", re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
 
