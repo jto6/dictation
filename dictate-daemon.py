@@ -1145,7 +1145,9 @@ class DictationDaemon:
                 for i, seg in enumerate(segments):
                     gap = seg.start - prev_end
                     gap_flag = f" [GAP {gap:.1f}s]" if gap > 0.5 else ""
-                    log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag} {seg.text.strip()[:80]}")
+                    nsp = getattr(seg, 'no_speech_prob', None)
+                    nsp_flag = f" [nsp={nsp:.2f}]" if nsp is not None else ""
+                    log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
                 # Drop trailing segments after long silence gaps (hallucinations from dead air).
                 # Only drop if the remaining speech is short - a long gap mid-dictation is just
