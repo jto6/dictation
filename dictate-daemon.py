@@ -104,7 +104,8 @@ REPLACEMENTS = {
     "slash status": "/status",
     "slash ": "/",  # Generic fallback for "slash X" → "/X"
     "npack": "NPAC",
-    "SDV plus": "SDV+"
+    "SDV plus": "SDV+",
+    "TI-OVX": "TIOVX"
 }
 
 # Common Whisper hallucinations (typically appear at end of transcription)
