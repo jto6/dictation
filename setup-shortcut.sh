@@ -6,10 +6,11 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOGGLE_SCRIPT="$SCRIPT_DIR/start-dictation-daemon.sh"
+PICK_SCRIPT="$SCRIPT_DIR/bin/dictate-pick"
 BINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate-toggle/"
 MODE_BINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate-mode/"
-SHORTCUT="${1:-<Super>w}"
-MODE_SHORTCUT="${2:-<Super><Shift>w}"
+SHORTCUT="${1:-<Super>z}"
+MODE_SHORTCUT="${2:-<Super>x}"
 
 # Check if we're on GNOME
 if [[ "$XDG_CURRENT_DESKTOP" != *"GNOME"* ]]; then
@@ -65,8 +66,8 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$BI
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$BINDING_PATH binding "$SHORTCUT"
 
 # Set the mode keybinding properties
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH name "Dictate Mode Toggle"
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH command "$TOGGLE_SCRIPT mode"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH name "Dictate Pick Mode"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH command "$PICK_SCRIPT"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$MODE_BINDING_PATH binding "$MODE_SHORTCUT"
 
 # Setup autostart
@@ -95,11 +96,10 @@ echo "  1. Press $SHORTCUT to start recording"
 echo "  2. Speak your message"
 echo "  3. Press $SHORTCUT again to stop and transcribe"
 echo ""
-echo "  Press $MODE_SHORTCUT to switch between batch and streaming modes"
-echo "    • Batch mode: transcribes all at once when stopped (more accurate)"
-echo "    • Streaming mode: transcribes phrases as you speak (more responsive)"
+echo "  Press $MODE_SHORTCUT to open the mode picker (dictate-pick)"
+echo "    • Choose recording mode and post-processing command"
 echo ""
 echo "To use different shortcuts, run:"
-echo "  $0 '<Super>F9' '<Super><Shift>F9'"
+echo "  $0 '<Super>F9' '<Super>F10'"
 echo ""
 echo "To verify, check: Settings → Keyboard → Custom Shortcuts"

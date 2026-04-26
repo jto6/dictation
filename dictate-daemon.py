@@ -11,6 +11,7 @@ Usage:
 
 import os
 import re
+import shlex
 import sys
 import socket
 import signal
@@ -108,6 +109,42 @@ REPLACEMENTS = {
     "TI-OVX": "TIOVX"
 }
 
+# Post-processing for batch transcription. Empty list = raw (no rewrite).
+# The value is an argv list passed to subprocess; the first token must be on
+# POST_CMD_SAFELIST to prevent the IPC channel from becoming a generic exec.
+DEFAULT_BATCH_POST_CMD: list = []
+
+POST_CMD_SAFELIST = {"text-clean", "bulletize"}
+
+POST_TIMEOUT_SEC = 30  # fall back to raw if wrapper exceeds this
+
+
+def _read_claude_api_env() -> tuple[dict, str]:
+    """Read API env vars and node bin dir from ~/.claude/settings.json.
+
+    Returns (env_dict, node_bin_dir). Both may be empty/empty-string if the
+    file is absent or malformed.
+    """
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return {}, ""
+
+    env = {k: v for k, v in settings.get("env", {}).items() if isinstance(v, str)}
+
+    node_bin_dir = ""
+    helper = settings.get("apiKeyHelper", "")
+    if helper:
+        try:
+            node_exe = shlex.split(helper)[0]
+            node_bin_dir = str(Path(node_exe).parent)
+        except (ValueError, IndexError):
+            pass
+
+    return env, node_bin_dir
+
 # Common Whisper hallucinations (typically appear at end of transcription)
 # These are artifacts from YouTube training data
 # Common Whisper hallucination patterns (typically at end of transcription).
@@ -143,6 +180,7 @@ PID_FILE = STATE_DIR / "daemon.pid"
 LOG_FILE = STATE_DIR / "daemon.log"
 AUDIO_FILE = STATE_DIR / "recording.wav"
 LAST_AUDIO_FILE = STATE_DIR / "last-recording.wav"
+POST_CMD_FILE = STATE_DIR / "batch-post-cmd"
 
 
 def normalize_whitespace(text: str) -> str:
@@ -350,9 +388,10 @@ def reset_modifier_keys():
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
     try:
         if session_type == "wayland":
-            # Release all modifiers via ydotool (29=ctrl, 42=shift, 56=alt)
+            # Release all modifiers via ydotool
+            # 29=ctrl, 42=shift, 56=alt, 125=Super_L, 126=Super_R
             subprocess.run(
-                ["ydotool", "key", "29:0", "42:0", "56:0"],
+                ["ydotool", "key", "29:0", "42:0", "56:0", "125:0", "126:0"],
                 capture_output=True,
                 timeout=2
             )
@@ -435,16 +474,26 @@ def type_text(text: str):
         log(f"Pasted: {text}")
 
 
+TERMINAL_APP_IDS = {
+    "com.mitchellh.ghostty", "ghostty",
+    "gnome-terminal", "gnome-terminal-server",
+    "xterm", "urxvt", "alacritty", "kitty", "konsole",
+    "terminator", "tilix", "xfce4-terminal", "lxterminal",
+    "st", "foot", "wezterm", "rio", "contour", "org.gnome.terminal",
+}
+
+
 def _is_terminal_focused_wayland():
     """Check if the focused Wayland window is a terminal emulator."""
+    import re as _re
+
+    # --- Sway ---
     try:
-        # swaymsg works on sway; other compositors may need different approaches
         result = subprocess.run(
             ["swaymsg", "-t", "get_tree"],
             capture_output=True, text=True, timeout=2
         )
         if result.returncode == 0:
-            import json
             tree = json.loads(result.stdout)
             def find_focused(node):
                 if node.get("focused"):
@@ -456,16 +505,56 @@ def _is_terminal_focused_wayland():
                 return None
             app_id = find_focused(tree)
             if app_id:
-                terminals = {
-                    "ghostty", "gnome-terminal", "gnome-terminal-server",
-                    "xterm", "urxvt", "alacritty", "kitty", "konsole",
-                    "terminator", "tilix", "xfce4-terminal", "lxterminal",
-                    "st", "foot", "wezterm", "rio", "contour",
-                }
-                return app_id in terminals
+                return app_id in TERMINAL_APP_IDS
     except Exception:
         pass
+
+    # --- GNOME / generic: xdotool + xprop via XWayland compatibility layer ---
+    try:
+        win_id = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True, text=True, timeout=2
+        ).stdout.strip()
+        if win_id:
+            xprop_out = subprocess.run(
+                ["xprop", "-id", win_id, "WM_CLASS"],
+                capture_output=True, text=True, timeout=2
+            ).stdout
+            # WM_CLASS(STRING) = "ghostty", "com.mitchellh.ghostty"
+            for cls in _re.findall(r'"([^"]+)"', xprop_out):
+                if cls.lower() in TERMINAL_APP_IDS:
+                    return True
+    except Exception:
+        pass
+
     return False
+
+
+def _ydotool_type(text: str):
+    """Type text with ydotool, replacing \\n with Enter key events.
+
+    ydotool maps \\n (0x0a) to KEY_LINEFEED rather than KEY_ENTER, which
+    triggers Ctrl+J in Emacs and other apps. Split on newlines and send
+    explicit Enter key (keycode 28) between segments.
+    """
+    parts = text.split('\n')
+    for i, part in enumerate(parts):
+        if part:
+            subprocess.run(
+                ["ydotool", "type", "--key-delay", "10", "--", part],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        if i < len(parts) - 1:
+            subprocess.run(
+                ["ydotool", "key", "28:1", "28:0"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
 
 
 def _paste_wayland(text: str):
@@ -477,6 +566,8 @@ def _paste_wayland(text: str):
     keystrokes fine, and some don't support Ctrl+Shift+V.
     """
     if _is_terminal_focused_wayland():
+        log("paste: terminal detected, using wl-copy + Ctrl+Shift+V")
+        wl_proc = None
         try:
             # Save current clipboard
             saved = subprocess.run(
@@ -485,81 +576,144 @@ def _paste_wayland(text: str):
             )
             saved_clip = saved.stdout if saved.returncode == 0 else None
 
-            # Set clipboard to our text
-            subprocess.run(
-                ["wl-copy", "--", text],
-                check=True, capture_output=True, timeout=2
+            # wl-copy stays alive as the Wayland clipboard owner and never exits,
+            # so use Popen (matching _paste_x11's xclip approach).
+            wl_proc = subprocess.Popen(
+                ["wl-copy"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            wl_proc.stdin.write(text.encode("utf-8"))
+            wl_proc.stdin.close()
+
+            # Small delay to let wl-copy register as clipboard owner
+            time.sleep(0.05)
 
             # Paste with Ctrl+Shift+V
             subprocess.run(
                 ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
             )
+            log("paste: Ctrl+Shift+V sent")
 
             # Brief delay to let paste complete before restoring clipboard
             time.sleep(0.1)
 
+            # Kill our wl-copy instance before restoring previous clipboard
+            wl_proc.terminate()
+            wl_proc.wait(timeout=1)
+            wl_proc = None
+
             # Restore previous clipboard
             if saved_clip is not None:
-                subprocess.run(
-                    ["wl-copy", "--", saved_clip.decode("utf-8", errors="replace")],
-                    capture_output=True, timeout=2
+                restore_proc = subprocess.Popen(
+                    ["wl-copy"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
+                restore_proc.stdin.write(saved_clip)
+                restore_proc.stdin.close()
 
             return
         except FileNotFoundError:
             log("wl-copy/wl-paste not found, falling back to ydotool type")
         except Exception as e:
             log(f"Clipboard paste failed ({e}), falling back to ydotool type")
+        finally:
+            if wl_proc is not None:
+                wl_proc.terminate()
 
-    # Simulated keystrokes — works universally (Emacs, browsers, etc.)
+        # Terminal clipboard paste failed — ydotool type directly
+        log("paste: terminal clipboard failed, falling back to _ydotool_type")
+        _ydotool_type(text)
+        return
+
+    # Non-terminal: try xdotool type first — it handles \t and \n correctly and
+    # works for X11/XWayland apps (Emacs, etc.) running under GNOME Wayland.
     try:
-        subprocess.run(
-            ["ydotool", "type", "--key-delay", "10", "--", text],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60
-        )
-    except subprocess.TimeoutExpired:
-        log(f"ydotool type timed out for {len(text)} chars")
-        raise
-    except Exception as e:
-        log(f"ydotool type error: {e}")
-        raise
-
-
-def _is_terminal_focused_x11():
-    """Check if the focused X11 window is a terminal emulator."""
-    try:
-        result = subprocess.run(
-            ["xdotool", "getactivewindow", "getwindowclassname"],
+        win_id = subprocess.run(
+            ["xdotool", "getactivewindow"],
             capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            wm_class = result.stdout.strip().lower()
-            terminals = {
-                "ghostty", "gnome-terminal", "gnome-terminal-server",
-                "xterm", "urxvt", "alacritty", "kitty", "konsole",
-                "terminator", "tilix", "xfce4-terminal", "lxterminal",
-                "st", "foot", "wezterm", "rio", "contour", "cool-retro-term",
-            }
-            return wm_class in terminals
+        ).stdout.strip()
+        if win_id:
+            log(f"paste: non-terminal X11 window {win_id}, using xdotool type")
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
+                check=True, capture_output=True, timeout=60
+            )
+            return
     except Exception:
         pass
-    return False
+
+    log("paste: native Wayland non-terminal, using _ydotool_type")
+    _ydotool_type(text)
+
+
+X11_TERMINAL_APP_IDS = {
+    "ghostty", "gnome-terminal", "gnome-terminal-server",
+    "xterm", "urxvt", "alacritty", "kitty", "konsole",
+    "terminator", "tilix", "xfce4-terminal", "lxterminal",
+    "st", "foot", "wezterm", "rio", "contour", "cool-retro-term",
+}
+
+
+def _xdotool_type(text: str):
+    """Type text with xdotool, replacing \\n with Return key events.
+
+    xdotool type maps \\n (0x0a) to XK_Linefeed which is C-j in Emacs,
+    not the Return key. Split on newlines and send explicit Return between.
+    """
+    parts = text.split('\n')
+    for i, part in enumerate(parts):
+        if part:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", part],
+                check=True, capture_output=True, timeout=60,
+            )
+        if i < len(parts) - 1:
+            subprocess.run(
+                ["xdotool", "key", "--clearmodifiers", "Return"],
+                check=True, capture_output=True, timeout=5,
+            )
 
 
 def _paste_x11(text: str):
-    """Paste text on X11, using clipboard paste for terminals and xdotool type otherwise.
+    """Paste text on X11 using the best method for the focused app.
 
-    Terminals are susceptible to PTY buffer overflow when xdotool type simulates
-    keystrokes faster than they can process. Clipboard paste (Ctrl+Shift+V) is
-    atomic and avoids this. Other apps (Emacs, browsers, etc.) handle simulated
-    keystrokes fine, and some don't support Ctrl+Shift+V.
+    - Terminals: xclip + Ctrl+Shift+V (atomic, preserves all characters)
+    - Emacs: xclip + Shift+Insert (= clipboard-yank, inserts text literally
+      including \\n and \\t without triggering key bindings)
+    - Other: _xdotool_type with \\n split to Return key events
     """
-    if _is_terminal_focused_x11():
+    # Detect focused window using two-step xdotool + xprop (more reliable than
+    # the compound "getactivewindow getwindowclassname" form which can silently
+    # return empty on some X11 configurations).
+    win_class = ""
+    try:
+        win_id = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True, text=True, timeout=2
+        ).stdout.strip()
+        if win_id:
+            xprop_out = subprocess.run(
+                ["xprop", "-id", win_id, "WM_CLASS"],
+                capture_output=True, text=True, timeout=2
+            ).stdout
+            # WM_CLASS(STRING) = "instance", "Class" — check both components
+            classes = [m.lower() for m in re.findall(r'"([^"]+)"', xprop_out)]
+            win_class = " ".join(classes)
+            log(f"paste: X11 window {win_id} WM_CLASS={win_class!r}")
+    except Exception as e:
+        log(f"paste: window detection error: {e}")
+
+    is_terminal = win_class in X11_TERMINAL_APP_IDS
+    is_emacs = "emacs" in win_class
+
+    if is_terminal or is_emacs:
+        label = "terminal" if is_terminal else "emacs"
+        log(f"paste: {label} ({win_class}), using xclip clipboard paste")
         xclip_proc = None
         try:
             # Save current clipboard
@@ -569,8 +723,7 @@ def _paste_x11(text: str):
             )
             saved_clip = saved.stdout if saved.returncode == 0 else None
 
-            # Set clipboard to our text. xclip forks and stays alive to serve
-            # the X11 selection protocol, so we must not wait for it to exit.
+            # xclip stays alive as X11 clipboard owner; use Popen, don't wait.
             xclip_proc = subprocess.Popen(
                 ["xclip", "-selection", "clipboard"],
                 stdin=subprocess.PIPE,
@@ -580,24 +733,28 @@ def _paste_x11(text: str):
             xclip_proc.stdin.write(text.encode("utf-8"))
             xclip_proc.stdin.close()
 
-            # Small delay to let xclip register as the clipboard owner
             time.sleep(0.05)
 
-            # Paste with Ctrl+Shift+V
-            subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
-                check=True, capture_output=True, timeout=5
-            )
+            if is_terminal:
+                # Terminals: Ctrl+Shift+V (bracketed paste, newlines literal)
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
+                    check=True, capture_output=True, timeout=5
+                )
+            else:
+                # Emacs: Shift+Insert = clipboard-yank, inserts text literally
+                # including \n and \t without triggering any key bindings.
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "shift+Insert"],
+                    check=True, capture_output=True, timeout=5
+                )
 
-            # Brief delay to let paste complete before restoring clipboard
             time.sleep(0.1)
 
-            # Kill the xclip process (it would run forever otherwise)
             xclip_proc.terminate()
             xclip_proc.wait(timeout=1)
             xclip_proc = None
 
-            # Restore previous clipboard
             if saved_clip is not None:
                 restore_proc = subprocess.Popen(
                     ["xclip", "-selection", "clipboard"],
@@ -617,20 +774,9 @@ def _paste_x11(text: str):
             if xclip_proc is not None:
                 xclip_proc.terminate()
 
-    # Simulated keystrokes — works universally (Emacs, browsers, etc.)
-    try:
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
-            check=True,
-            capture_output=True,
-            timeout=60
-        )
-    except subprocess.TimeoutExpired:
-        log(f"xdotool type timed out for {len(text)} chars")
-        raise
-    except Exception as e:
-        log(f"xdotool type error: {e}")
-        raise
+    # Other apps: xdotool type with \n → Return (avoids XK_Linefeed/Ctrl+J)
+    log(f"paste: other app ({win_class}), using _xdotool_type")
+    _xdotool_type(text)
 
 
 def get_gpu_vram_mb():
@@ -812,6 +958,9 @@ class DictationDaemon:
         self.stream = None
         self.running = True
         self.lock = threading.Lock()
+
+        # Batch post-processing command — restored from file if present
+        self.batch_post_cmd: list = self._load_post_cmd()
 
         # Streaming mode state
         self.streaming_mode = False  # False = batch mode, True = streaming mode
@@ -1205,6 +1354,8 @@ class DictationDaemon:
                 log(f"Transcribed in {elapsed:.2f}s: {raw_text} → {text}")
             else:
                 log(f"Transcribed in {elapsed:.2f}s: {text}")
+            log(f"Raw transcript: {text}")
+            text = self._run_post_processor(text)
         except Exception as e:
             log(f"Transcription error: {e}")
             text = ""
@@ -1218,6 +1369,92 @@ class DictationDaemon:
         else:
             notify("No speech detected", "normal")
             return "No speech"
+
+    def _load_post_cmd(self) -> list:
+        try:
+            raw = POST_CMD_FILE.read_text().strip()
+            if raw and raw != "raw":
+                argv = shlex.split(raw)
+                if argv and argv[0] in POST_CMD_SAFELIST:
+                    log(f"Restored post-cmd: {shlex.join(argv)}")
+                    return argv
+        except (OSError, ValueError):
+            pass
+        return list(DEFAULT_BATCH_POST_CMD)
+
+    def _save_post_cmd(self):
+        try:
+            cmd = shlex.join(self.batch_post_cmd) if self.batch_post_cmd else "raw"
+            POST_CMD_FILE.write_text(cmd)
+        except OSError:
+            pass
+
+    def set_batch_post_cmd(self, args_str: str) -> str:
+        args_str = args_str.strip()
+        if args_str in ("", "raw"):
+            with self.lock:
+                self.batch_post_cmd = []
+            self._save_post_cmd()
+            return "Batch post-cmd: raw"
+        try:
+            argv = shlex.split(args_str)
+        except ValueError as e:
+            return f"Parse error: {e}"
+        if not argv or argv[0] not in POST_CMD_SAFELIST:
+            return (f"First token must be one of: "
+                    f"{', '.join(sorted(POST_CMD_SAFELIST))} (or 'raw')")
+        with self.lock:
+            self.batch_post_cmd = argv
+        self._save_post_cmd()
+        if self.streaming_mode:
+            log(f"Warning: post-cmd set to '{shlex.join(argv)}' but daemon is in streaming mode; it won't apply until batch mode is active")
+        return f"Batch post-cmd: {shlex.join(argv)}"
+
+    def get_batch_post_cmd(self) -> str:
+        return shlex.join(self.batch_post_cmd) if self.batch_post_cmd else "raw"
+
+    def _run_post_processor(self, text: str) -> str:
+        cmd = list(self.batch_post_cmd)
+        if not cmd:
+            return text
+        label = shlex.join(cmd)
+        # Extend PATH so that `clip`, `text-clean`, and `bulletize` are found.
+        # They live in ~/dev/claudecode_workflows/bin/ which may not be on the daemon's PATH.
+        extra_bin = str(Path.home() / "dev" / "claudecode_workflows" / "bin")
+        env = os.environ.copy()
+        env["PATH"] = extra_bin + ":" + env.get("PATH", "")
+
+        # Inject API credentials from ~/.claude/settings.json (absent in daemon env).
+        # Also add the node bin dir so llm-rewrite can call the token helper.
+        api_env, node_bin_dir = _read_claude_api_env()
+        env.update(api_env)
+        if node_bin_dir:
+            env["PATH"] = node_bin_dir + ":" + env["PATH"]
+        try:
+            notify(f"✏️ Rewriting ({label})...", "low")
+            # Use --stdin to pipe text directly; avoids wl-copy blocking on clipboard write.
+            rewritten = subprocess.run(
+                [cmd[0], "--stdin"] + cmd[1:],
+                input=text, capture_output=True, text=True,
+                timeout=POST_TIMEOUT_SEC, check=True, env=env,
+            ).stdout
+            if not rewritten.strip():
+                log(f"Post-processor {label} returned empty; using raw")
+                return text
+            log(f"Post-processed via {label}: {len(text)} → {len(rewritten)} chars")
+            return rewritten
+        except subprocess.TimeoutExpired:
+            log(f"Post-processor {label} timed out after {POST_TIMEOUT_SEC}s; using raw")
+            notify("⚠️ Rewrite timeout — using raw transcript", "normal")
+            return text
+        except subprocess.CalledProcessError as e:
+            log(f"Post-processor {label} failed (exit {e.returncode}): {e.stderr}")
+            notify("⚠️ Rewrite failed — using raw transcript", "normal")
+            return text
+        except FileNotFoundError:
+            log(f"Post-processor command not found: {cmd[0]}; using raw")
+            notify("⚠️ Rewrite tool missing — using raw transcript", "normal")
+            return text
 
     def toggle(self) -> str:
         """Toggle recording state."""
@@ -1293,9 +1530,25 @@ class DictationDaemon:
             elif data == "status":
                 mode = self.get_mode()
                 state = "Recording" if self.recording else "Idle"
-                response = f"{state} ({mode} mode)"
+                response = (f"{state} ({mode} mode, "
+                            f"post={self.get_batch_post_cmd()})")
             elif data == "mode":
                 response = self.toggle_mode()
+            elif data.startswith("post-cmd "):
+                args_str = data[len("post-cmd "):]
+                response = self.set_batch_post_cmd(args_str)
+            elif data == "post-cmd":
+                response = f"Batch post-cmd: {self.get_batch_post_cmd()}"
+            elif data.startswith("set-mode "):
+                target = data[len("set-mode "):].strip()
+                if target not in ("batch", "streaming"):
+                    response = "set-mode requires 'batch' or 'streaming'"
+                else:
+                    want_streaming = (target == "streaming")
+                    if self.streaming_mode != want_streaming:
+                        response = self.toggle_mode()
+                    else:
+                        response = f"Mode: {target}"
             elif data == "quit":
                 self.running = False
                 response = "Shutting down"
@@ -1457,8 +1710,30 @@ def main():
             print(f"Daemon running, state: {response}")
         else:
             print("Daemon not running")
+    elif cmd == "post-cmd":
+        if not is_daemon_running():
+            print("Daemon not running. Start with: dictate-daemon.py start")
+            sys.exit(1)
+        if len(sys.argv) >= 3:
+            rest = " ".join(sys.argv[2:])
+            response = send_command(f"post-cmd {rest}")
+        else:
+            response = send_command("post-cmd")
+        print(response)
+    elif cmd == "set-mode":
+        if not is_daemon_running():
+            print("Daemon not running. Start with: dictate-daemon.py start")
+            sys.exit(1)
+        if len(sys.argv) < 3:
+            print("Usage: dictate-daemon.py set-mode batch|streaming")
+            sys.exit(1)
+        response = send_command(f"set-mode {sys.argv[2]}")
+        print(response)
     else:
-        print(f"Usage: {sys.argv[0]} [start|stop|toggle|mode|status]")
+        print(f"Usage: {sys.argv[0]} "
+              f"[start|stop|toggle|mode|"
+              f"set-mode <batch|streaming>|"
+              f"post-cmd [raw|<wrapper> [args...]]|status]")
         sys.exit(1)
 
 

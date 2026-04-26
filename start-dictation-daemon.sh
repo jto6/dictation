@@ -32,4 +32,4 @@ if [ "$CMD" = "toggle" ] || [ "$CMD" = "mode" ]; then
     fi
 fi
 
-exec python3 dictate-daemon.py "$CMD"
+exec python3 dictate-daemon.py "$@"

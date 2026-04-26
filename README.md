@@ -39,11 +39,12 @@ cd dictation
 ```
 
 The install script automatically:
+
 - Creates a Python virtual environment
 - Installs dependencies (faster-whisper, sounddevice, etc.)
 - Detects NVIDIA GPU and installs cuDNN for acceleration
 - Configures GPU or CPU mode appropriately
-- Sets up keyboard shortcut (GNOME) - **Super+W** by default
+- Sets up keyboard shortcuts (GNOME) - **Super+Z** to toggle, **Super+X** for mode picker
 - Configures autostart so the daemon starts on login
 
 ### Manual Install
@@ -74,11 +75,22 @@ chmod +x *.py *.sh
 
 ### Basic Usage
 
-1. **Press Super+W** - Recording starts (notification appears)
+1. **Press Super+Z** - Recording starts (notification appears)
 2. **Speak** your message
-3. **Press Super+W** again - Stops, transcribes, and types at cursor
+3. **Press Super+Z** again - Stops, transcribes, and types at cursor
 
 The first toggle after login takes ~2-3 seconds (loads the Whisper model). Subsequent uses are instant.
+
+### Choosing a Mode
+
+Press **Super+X** to open the mode picker (`dictate-pick`). A rofi/zenity menu lets you choose the recording mode and post-processing command in one step:
+
+- **streaming** — transcribes phrases in real-time as you speak, no rewriting
+- **batch + text-clean** — records until you stop, then cleans up the text
+- **batch + bulletize** — records until you stop, then formats as bullet points
+- **batch + raw** — records until you stop, typed as-is with no rewriting
+
+The selection is remembered and shown at the top of the menu on the next open. After picking, press Super+Z to start recording with the new mode.
 
 ### Manual Commands
 
@@ -101,9 +113,9 @@ The first toggle after login takes ~2-3 seconds (loads the Whisper model). Subse
 ### Custom Keyboard Shortcut
 
 ```bash
-# Use a different shortcut
-./setup-shortcut.sh '<Ctrl><Alt>d'    # Ctrl+Alt+D
-./setup-shortcut.sh '<Super>F9'       # Super+F9
+# Use different shortcuts (toggle, mode-picker)
+./setup-shortcut.sh '<Super>F9' '<Super>F10'
+./setup-shortcut.sh '<Ctrl><Alt>d' '<Ctrl><Alt>m'
 ```
 
 ### Fix Transcription Errors
@@ -185,6 +197,7 @@ MODEL_SIZE = "base.en"  # Good balance of speed/accuracy
 ### Daemon Mode
 
 The daemon (`dictate-daemon.py`) runs as a background process:
+
 - Listens on Unix socket `/tmp/whisper-dictation/daemon.sock`
 - Keeps Whisper model loaded in memory (~500MB-1GB)
 - Responds to toggle/start/stop/status commands
@@ -192,6 +205,7 @@ The daemon (`dictate-daemon.py`) runs as a background process:
 ### Autostart
 
 A `.desktop` file is installed to `~/.config/autostart/`:
+
 - Daemon starts automatically on GNOME login
 - Model is pre-loaded before you need it
 - First dictation is instant (no loading delay)

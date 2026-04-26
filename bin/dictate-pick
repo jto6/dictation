@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# dictate-pick — pick recording mode + post-cmd in one shot.
+# Does not start recording; press the toggle shortcut (Super+Z) after selecting.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DAEMON="$SCRIPT_DIR/start-dictation-daemon.sh"
+STATE_DIR=/tmp/whisper-dictation
+HISTORY_FILE="$STATE_DIR/mode-history"
+mkdir -p "$STATE_DIR"
+
+# Read recency-ordered history (one label per line, most recent first)
+history_modes=()
+if [ -s "$HISTORY_FILE" ]; then
+	while IFS= read -r line; do
+		[ -n "$line" ] && history_modes+=("$line")
+	done < "$HISTORY_FILE"
+fi
+
+# Each entry: "<recording-mode>|<post-cmd>|<display-label>"
+# Streaming is always raw (phrase-by-phrase rewrite would stutter).
+declare -a entries=(
+  "streaming|raw|streaming (real-time, raw)"
+  "batch|text-clean -journal|text-clean -journal"
+  "batch|text-clean -conversational|text-clean -conversational"
+  "batch|text-clean|text-clean"
+  "batch|bulletize -journal|bulletize -journal"
+  "batch|bulletize -conversational|bulletize -conversational"
+  "batch|bulletize|bulletize"
+  "batch|bulletize -journal -mmap|bulletize -journal -mmap"
+  "batch|bulletize -mmap|bulletize -mmap"
+  "batch|raw|batch (raw, no rewrite)"
+)
+
+# Build menu: history order first (most-recent at top), then never-used entries
+menu_items=()
+declare -A _in_menu
+
+# Add history items in recency order; mark the most recent with ↻
+_first_history=1
+for _mode in "${history_modes[@]}"; do
+	# Only include labels that still exist in the entries list
+	for e in "${entries[@]}"; do
+		if [ "${e##*|}" = "$_mode" ]; then
+			if [ "$_first_history" -eq 1 ]; then
+				menu_items+=("↻ $_mode")
+				_first_history=0
+			else
+				menu_items+=("$_mode")
+			fi
+			_in_menu["$_mode"]=1
+			break
+		fi
+	done
+done
+
+# Append entries not yet in menu (never used), in original order
+for e in "${entries[@]}"; do
+	label="${e##*|}"
+	[ -z "${_in_menu[$label]:-}" ] && menu_items+=("$label")
+done
+
+# --- Picker: fzf-in-xterm > rofi > zenity ---
+
+pick=""
+
+FZF_BIN=$(command -v fzf 2>/dev/null || true)
+[ -z "$FZF_BIN" ] && [ -x /home/jon/installedSW/fzf/bin/fzf ] && FZF_BIN=/home/jon/installedSW/fzf/bin/fzf
+
+if [ -n "$FZF_BIN" ] && command -v xterm >/dev/null 2>&1; then
+	menu_file=$(mktemp /tmp/dictate-pick.XXXXXX)
+	result_file=$(mktemp /tmp/dictate-pick.XXXXXX)
+	helper=$(mktemp /tmp/dictate-pick.XXXXXX)
+	printf '%s\n' "${menu_items[@]}" > "$menu_file"
+	cat > "$helper" <<-EOF
+		#!/usr/bin/env bash
+		"$FZF_BIN" --prompt='Mode: ' --height=100% --reverse --no-sort < "$menu_file" > "$result_file" || true
+	EOF
+	chmod +x "$helper"
+	xterm -geometry 64x16 -title "Dictate mode" -e "$helper"
+	pick=$(cat "$result_file")
+	rm -f "$menu_file" "$result_file" "$helper"
+elif command -v rofi >/dev/null 2>&1; then
+	pick=$(printf '%s\n' "${menu_items[@]}" | \
+		rofi -dmenu -i -p "Dictate" -lines 12 \
+		-theme-str 'window {width: 32em;}') || true
+elif command -v zenity >/dev/null 2>&1; then
+	pick=$(zenity --list --column=Mode \
+		--title="Dictate" --hide-header --width=420 --height=420 \
+		"${menu_items[@]}") || true
+else
+	notify-send "dictate-pick: install fzf, rofi, or zenity"
+	exit 1
+fi
+
+[ -z "$pick" ] && exit 0
+
+# Strip "↻ " prefix if present (marks the most-recently-used item)
+case "$pick" in
+	"↻ "*) pick="${pick#↻ }" ;;
+esac
+
+# Look up entry by display label to recover (recording_mode, post_cmd)
+rec_mode=""; post_cmd=""
+for e in "${entries[@]}"; do
+	if [ "${e##*|}" = "$pick" ]; then
+		rec_mode="${e%%|*}"
+		rest="${e#*|}"
+		post_cmd="${rest%%|*}"
+		break
+	fi
+done
+
+if [ -z "$rec_mode" ]; then
+	notify-send "dictate-pick: unrecognized selection: $pick"
+	exit 1
+fi
+
+"$DAEMON" set-mode "$rec_mode" >/dev/null
+"$DAEMON" post-cmd "$post_cmd" >/dev/null
+
+# Update history: selected mode first, then previous history entries (deduped)
+{
+	echo "$pick"
+	for _mode in "${history_modes[@]}"; do
+		[ "$_mode" != "$pick" ] && echo "$_mode"
+	done
+} > "$HISTORY_FILE"
+
+notify-send "Dictate: $pick"
