@@ -60,26 +60,38 @@ for e in "${entries[@]}"; do
 	[ -z "${_in_menu[$label]:-}" ] && menu_items+=("$label")
 done
 
-# --- Picker: fzf-in-xterm > rofi > zenity ---
+# --- Picker: fzf-in-terminal > rofi > zenity ---
 
 pick=""
 
 FZF_BIN=$(command -v fzf 2>/dev/null || true)
 [ -z "$FZF_BIN" ] && [ -x /home/jon/installedSW/fzf/bin/fzf ] && FZF_BIN=/home/jon/installedSW/fzf/bin/fzf
 
-if [ -n "$FZF_BIN" ] && command -v xterm >/dev/null 2>&1; then
+TERM_CMD=()
+if command -v ghostty >/dev/null 2>&1; then
+	TERM_CMD=(ghostty --gtk-single-instance=false --title="Dictate mode" -e)
+elif command -v xterm >/dev/null 2>&1; then
+	TERM_CMD=(xterm -geometry 64x16 -title "Dictate mode" -e)
+fi
+
+if [ -n "$FZF_BIN" ] && [ ${#TERM_CMD[@]} -gt 0 ]; then
 	menu_file=$(mktemp /tmp/dictate-pick.XXXXXX)
 	result_file=$(mktemp /tmp/dictate-pick.XXXXXX)
+	done_file=$(mktemp -u /tmp/dictate-pick.XXXXXX)
 	helper=$(mktemp /tmp/dictate-pick.XXXXXX)
 	printf '%s\n' "${menu_items[@]}" > "$menu_file"
 	cat > "$helper" <<-EOF
 		#!/usr/bin/env bash
 		"$FZF_BIN" --prompt='Mode: ' --height=100% --reverse --no-sort < "$menu_file" > "$result_file" || true
+		: > "$done_file"
 	EOF
 	chmod +x "$helper"
-	xterm -geometry 64x16 -title "Dictate mode" -e "$helper"
+	# Ghostty's process may linger after the inner command exits, so don't `wait` on it.
+	# Just poll for the helper's done sentinel.
+	"${TERM_CMD[@]}" "$helper" >/dev/null 2>&1 &
+	while [ ! -e "$done_file" ]; do sleep 0.1; done
 	pick=$(cat "$result_file")
-	rm -f "$menu_file" "$result_file" "$helper"
+	rm -f "$menu_file" "$result_file" "$done_file" "$helper"
 elif command -v rofi >/dev/null 2>&1; then
 	pick=$(printf '%s\n' "${menu_items[@]}" | \
 		rofi -dmenu -i -p "Dictate" -lines 12 \
