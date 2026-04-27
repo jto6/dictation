@@ -116,7 +116,7 @@ DEFAULT_BATCH_POST_CMD: list = []
 
 POST_CMD_SAFELIST = {"text-clean", "bulletize"}
 
-POST_TIMEOUT_SEC = 30  # fall back to raw if wrapper exceeds this
+POST_TIMEOUT_SEC = 120  # fall back to raw if wrapper exceeds this
 
 
 def _read_claude_api_env() -> tuple[dict, str]:
@@ -406,7 +406,50 @@ def reset_modifier_keys():
         pass  # Best effort
 
 
-def type_text(text: str):
+def _wm_class_for_window(win_id: str) -> str:
+    try:
+        out = subprocess.run(
+            ["xprop", "-id", win_id, "WM_CLASS"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        return " ".join(m.lower() for m in re.findall(r'"([^"]+)"', out))
+    except Exception:
+        return ""
+
+
+def _emacs_insert(text: str) -> bool:
+    """Insert text into the buffer displayed in Emacs's most-recently-active
+    visible frame, without stealing window focus. Returns True on success.
+
+    A bare `(insert ...)` from emacsclient runs in the server's internal
+    " *server*" buffer (invisible), so we explicitly target the visible
+    frame's selected window's buffer.
+    """
+    # Escape for elisp string: backslashes and double quotes only.
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    elisp = (
+        '(let* ((frame (or (car (visible-frame-list)) (selected-frame)))'
+        '       (win (frame-selected-window frame))'
+        '       (buf (window-buffer win)))'
+        '  (with-current-buffer buf'
+        f'    (goto-char (window-point win))'
+        f'    (insert "{escaped}")'
+        f'    (set-window-point win (point))'
+        f'    (buffer-name buf)))'
+    )
+    try:
+        result = subprocess.run(
+            ["emacsclient", "-e", elisp],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        log(f"emacsclient inserted into buffer {result.stdout.strip()}")
+        return True
+    except Exception as e:
+        log(f"emacsclient insert failed ({e}); falling back to focus+paste")
+        return False
+
+
+def type_text(text: str, target_window_id: str | None = None):
     """Insert text using clipboard paste (more reliable than simulated typing).
 
     Simulated typing with xdotool/ydotool can drop or reorder characters when
@@ -414,9 +457,45 @@ def type_text(text: str):
     atomic and much more reliable.
 
     For very long text, paste in chunks to avoid terminal buffer issues.
+
+    If target_window_id is provided (X11 only), routes the paste back to the
+    window that was focused when recording started, so the transcription lands
+    in the right place even if focus moved during a slow AI rewrite. For Emacs
+    targets we use emacsclient (no focus change). For other apps we save the
+    currently focused window, activate the target, paste, then restore focus.
     """
     if not text:
         return
+
+    saved_focus_id: str | None = None
+    if target_window_id:
+        target_class = _wm_class_for_window(target_window_id)
+        # Emacs: insert via emacsclient — no focus change at all.
+        if "emacs" in target_class:
+            if _emacs_insert(text):
+                log(f"Inserted into Emacs via emacsclient ({len(text)} chars)")
+                return
+            # else: fall through to focus+paste
+
+        # Other apps: save current focus, activate target, paste, restore.
+        try:
+            saved_focus_id = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip() or None
+        except Exception:
+            saved_focus_id = None
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", target_window_id],
+                check=True, capture_output=True, timeout=2,
+            )
+            log(f"Refocused target window {target_window_id} for paste "
+                f"(will restore focus to {saved_focus_id})")
+        except Exception as e:
+            log(f"Target window {target_window_id} activate failed ({e}); "
+                f"pasting into current focus")
+            saved_focus_id = None  # don't restore if we didn't switch
 
     time.sleep(0.05)  # Brief delay for focus
 
@@ -467,6 +546,16 @@ def type_text(text: str):
 
     # Always reset modifier keys after pasting to prevent stuck state
     reset_modifier_keys()
+
+    if saved_focus_id and saved_focus_id != target_window_id:
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", saved_focus_id],
+                check=True, capture_output=True, timeout=2,
+            )
+            log(f"Restored focus to {saved_focus_id}")
+        except Exception as e:
+            log(f"Focus restore to {saved_focus_id} failed: {e}")
 
     if len(text) > 50:
         log(f"Pasted: {text[:50]}... ({len(text)} chars)")
@@ -973,6 +1062,10 @@ class DictationDaemon:
         self.phrase_has_speech = False  # Whether current phrase contains actual speech
         self.previous_text = ""        # Previous transcription for context conditioning
 
+        # Window that was focused when batch recording started. Used to refocus
+        # before pasting so the user can switch windows during slow AI rewrites.
+        self.target_window_id: str | None = None
+
     def load_model(self):
         """Load Whisper model with auto-detection and fallback.
 
@@ -1195,6 +1288,23 @@ class DictationDaemon:
             self.previous_text = ""  # Reset context for new recording session
             self.recording = True
 
+            # Capture the currently focused window so we can refocus it before
+            # pasting. Lets the user start dictation, then switch away and do
+            # other work while transcription / AI rewrite runs.
+            # Only meaningful in batch mode — streaming pastes immediately.
+            self.target_window_id = None
+            if not self.streaming_mode:
+                try:
+                    win_id = subprocess.run(
+                        ["xdotool", "getactivewindow"],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout.strip()
+                    if win_id:
+                        self.target_window_id = win_id
+                        log(f"Captured target window: {win_id}")
+                except Exception as e:
+                    log(f"Target window capture failed: {e}")
+
             self.stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
@@ -1364,9 +1474,12 @@ class DictationDaemon:
 
         if text:
             notify(f"✓ {text[:40]}..." if len(text) > 40 else f"✓ {text}", "low")
-            type_text(text)
+            target = self.target_window_id
+            self.target_window_id = None
+            type_text(text, target_window_id=target)
             return f"OK: {text}"
         else:
+            self.target_window_id = None
             notify("No speech detected", "normal")
             return "No speech"
 
