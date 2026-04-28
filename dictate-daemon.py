@@ -561,10 +561,7 @@ def type_text(text: str, target_window_id: str | None = None):
         except Exception as e:
             log(f"Focus restore to {saved_focus_id} failed: {e}")
 
-    if len(text) > 50:
-        log(f"Pasted: {text[:50]}... ({len(text)} chars)")
-    else:
-        log(f"Pasted: {text}")
+    log(f"Pasted ({len(text)} chars): {text}")
 
 
 TERMINAL_APP_IDS = {
