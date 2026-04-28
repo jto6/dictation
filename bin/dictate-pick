@@ -21,9 +21,17 @@ fi
 # Streaming is always raw (phrase-by-phrase rewrite would stutter).
 declare -a entries=(
   "streaming|raw|streaming (real-time, raw)"
+  "batch|text-clean --backend local -journal|text-clean -journal (local)"
+  "batch|text-clean --backend local -conversational|text-clean -conversational (local)"
+  "batch|text-clean --backend local|text-clean (local)"
   "batch|text-clean -journal|text-clean -journal"
   "batch|text-clean -conversational|text-clean -conversational"
   "batch|text-clean|text-clean"
+  "batch|bulletize --backend local -journal|bulletize -journal (local)"
+  "batch|bulletize --backend local -conversational|bulletize -conversational (local)"
+  "batch|bulletize --backend local|bulletize (local)"
+  "batch|bulletize --backend local -journal -mmap|bulletize -journal -mmap (local)"
+  "batch|bulletize --backend local -mmap|bulletize -mmap (local)"
   "batch|bulletize -journal|bulletize -journal"
   "batch|bulletize -conversational|bulletize -conversational"
   "batch|bulletize|bulletize"
