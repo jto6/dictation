@@ -468,8 +468,10 @@ def type_text(text: str, target_window_id: str | None = None):
         return
 
     saved_focus_id: str | None = None
+    target_is_terminal = False
     if target_window_id:
         target_class = _wm_class_for_window(target_window_id)
+        target_is_terminal = any(c in X11_TERMINAL_APP_IDS for c in target_class.split())
         # Emacs: insert via emacsclient — no focus change at all.
         if "emacs" in target_class:
             if _emacs_insert(text):
@@ -502,8 +504,10 @@ def type_text(text: str, target_window_id: str | None = None):
     # Detect session type and use appropriate tool
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
 
-    # Split into chunks for long text to avoid overwhelming terminals
-    if len(text) > PASTE_CHUNK_SIZE:
+    # Split into chunks for long text only when using xdotool type (non-terminal, non-emacs).
+    # Terminal clipboard paste (xclip + Ctrl+Shift+V) is atomic — chunking causes rapid
+    # save/restore cycles that freeze the X11 clipboard and lock up terminal windows.
+    if len(text) > PASTE_CHUNK_SIZE and not target_is_terminal:
         chunks = []
         remaining = text
         while remaining:
@@ -741,7 +745,7 @@ def _paste_wayland(text: str):
 
 
 X11_TERMINAL_APP_IDS = {
-    "ghostty", "gnome-terminal", "gnome-terminal-server",
+    "com.mitchellh.ghostty", "ghostty", "gnome-terminal", "gnome-terminal-server",
     "xterm", "urxvt", "alacritty", "kitty", "konsole",
     "terminator", "tilix", "xfce4-terminal", "lxterminal",
     "st", "foot", "wezterm", "rio", "contour", "cool-retro-term",
@@ -797,7 +801,7 @@ def _paste_x11(text: str):
     except Exception as e:
         log(f"paste: window detection error: {e}")
 
-    is_terminal = win_class in X11_TERMINAL_APP_IDS
+    is_terminal = any(c in X11_TERMINAL_APP_IDS for c in win_class.split())
     is_emacs = "emacs" in win_class
 
     if is_terminal or is_emacs:
