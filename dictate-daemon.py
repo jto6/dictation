@@ -188,6 +188,31 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
+NSP_TRAILING_THRESHOLD = 0.35  # drop trailing segments with no_speech_prob >= this
+
+def drop_trailing_high_nsp(segments: list) -> list:
+    """Drop trailing segments with high no_speech_prob (Whisper hallucinations).
+
+    When speech ends and there is trailing silence or noise, Whisper often
+    emits short filler segments like 'Thanks.' or 'All right.' with elevated
+    no_speech_prob values (0.3–0.7).  Strip them from the tail, but keep at
+    least one segment so we never discard a single-segment transcription.
+    """
+    cut = len(segments)
+    while cut > 1:
+        seg = segments[cut - 1]
+        nsp = getattr(seg, 'no_speech_prob', 0.0)
+        if nsp >= NSP_TRAILING_THRESHOLD:
+            cut -= 1
+        else:
+            break
+    if cut < len(segments):
+        dropped = " ".join(s.text.strip() for s in segments[cut:])
+        log(f"Dropped {len(segments) - cut} trailing high-nsp segment(s): '{dropped}'")
+        return segments[:cut]
+    return segments
+
+
 def drop_trailing_echo(segments: list) -> list:
     """Drop the final segment if it's a fuzzy echo of the previous segment's tail.
 
@@ -1453,6 +1478,7 @@ class DictationDaemon:
                         continue
                 filtered_segments.append(seg)
             segments = filtered_segments
+            segments = drop_trailing_high_nsp(segments)
             segments = drop_trailing_echo(segments)
             seg_texts = remove_segment_overlaps([seg.text for seg in segments])
             raw_text = " ".join(seg_texts).strip()
