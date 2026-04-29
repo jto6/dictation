@@ -35,7 +35,7 @@ CHANNELS = 1
 
 # Model/device/compute settings - will auto-detect best configuration
 # Set to specific values to override auto-detection
-MODEL_SIZE = "auto"  # "auto", "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
+MODEL_SIZE = "medium.en"  # "auto", "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
 DEVICE = "auto"  # "auto", "cuda", or "cpu"
 COMPUTE_TYPE = "auto"  # "auto", "float16", "float32", "int8"
 
