@@ -84,15 +84,20 @@ elif command -v xterm >/dev/null 2>&1; then
 	TERM_CMD=(xterm -geometry 64x16 -title "Dictate mode" -e)
 fi
 
+key_used=""
+
 if [ -n "$FZF_BIN" ] && [ ${#TERM_CMD[@]} -gt 0 ]; then
 	menu_file=$(mktemp /tmp/dictate-pick.XXXXXX)
 	result_file=$(mktemp /tmp/dictate-pick.XXXXXX)
 	done_file=$(mktemp -u /tmp/dictate-pick.XXXXXX)
 	helper=$(mktemp /tmp/dictate-pick.XXXXXX)
 	printf '%s\n' "${menu_items[@]}" > "$menu_file"
+	# --expect causes fzf to print the key name on line 1 and the selection on line 2.
+	# alt-enter = one-shot (apply for next dictation only, then restore previous mode)
 	cat > "$helper" <<-EOF
 		#!/usr/bin/env bash
-		"$FZF_BIN" --prompt='Mode: ' --height=100% --reverse --no-sort < "$menu_file" > "$result_file" || true
+		"$FZF_BIN" --prompt='Mode (alt-enter=one-shot): ' --height=100% --reverse --no-sort \
+			--expect=alt-enter < "$menu_file" > "$result_file" || true
 		: > "$done_file"
 	EOF
 	chmod +x "$helper"
@@ -100,7 +105,9 @@ if [ -n "$FZF_BIN" ] && [ ${#TERM_CMD[@]} -gt 0 ]; then
 	# Just poll for the helper's done sentinel.
 	"${TERM_CMD[@]}" "$helper" >/dev/null 2>&1 &
 	while [ ! -e "$done_file" ]; do sleep 0.1; done
-	pick=$(cat "$result_file")
+	# With --expect, fzf outputs: line 1 = pressed key (empty for plain Enter), line 2 = selection
+	key_used=$(head -1 "$result_file")
+	pick=$(tail -1 "$result_file")
 	rm -f "$menu_file" "$result_file" "$done_file" "$helper"
 elif command -v rofi >/dev/null 2>&1; then
 	pick=$(printf '%s\n' "${menu_items[@]}" | \
@@ -116,6 +123,12 @@ else
 fi
 
 [ -z "$pick" ] && exit 0
+
+# alt-enter = one-shot (apply mode for next dictation only, then auto-restore)
+one_shot=false
+if [ "$key_used" = "alt-enter" ]; then
+	one_shot=true
+fi
 
 # Strip "↻ " prefix if present (marks the most-recently-used item)
 case "$pick" in
@@ -138,15 +151,20 @@ if [ -z "$rec_mode" ]; then
 	exit 1
 fi
 
-"$DAEMON" set-mode "$rec_mode" >/dev/null
-"$DAEMON" post-cmd "$post_cmd" >/dev/null
+if $one_shot; then
+	"$DAEMON" one-shot "$rec_mode" "$post_cmd" >/dev/null
+	notify-send "Dictate (one-shot): $pick"
+else
+	"$DAEMON" set-mode "$rec_mode" >/dev/null
+	"$DAEMON" post-cmd "$post_cmd" >/dev/null
 
-# Update history: selected mode first, then previous history entries (deduped)
-{
-	echo "$pick"
-	for _mode in "${history_modes[@]}"; do
-		[ "$_mode" != "$pick" ] && echo "$_mode"
-	done
-} > "$HISTORY_FILE"
+	# Update history: selected mode first, then previous history entries (deduped)
+	{
+		echo "$pick"
+		for _mode in "${history_modes[@]}"; do
+			[ "$_mode" != "$pick" ] && echo "$_mode"
+		done
+	} > "$HISTORY_FILE"
 
-notify-send "Dictate: $pick"
+	notify-send "Dictate: $pick"
+fi

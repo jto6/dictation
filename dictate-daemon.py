@@ -1082,6 +1082,10 @@ class DictationDaemon:
         # Batch post-processing command — restored from file if present
         self.batch_post_cmd: list = self._load_post_cmd()
 
+        # When set, holds {"post_cmd": list, "streaming_mode": bool} to restore
+        # after the next completed transcription (one-shot mode support).
+        self.one_shot_restore: dict | None = None
+
         # Streaming mode state
         self.streaming_mode = False  # False = batch mode, True = streaming mode
         self.silence_samples = 0     # Count of consecutive silent samples
@@ -1401,6 +1405,7 @@ class DictationDaemon:
                 self.transcribe_thread.join(timeout=10)
             log("Streaming recording stopped")
             notify("⏹️ Done", "low")
+            self._maybe_restore_one_shot()
             return "Stopped"
 
         # Batch mode processing
@@ -1509,6 +1514,7 @@ class DictationDaemon:
             target = self.target_window_id
             self.target_window_id = None
             type_text(text, target_window_id=target)
+            self._maybe_restore_one_shot()
             return f"OK: {text}"
         else:
             self.target_window_id = None
@@ -1557,6 +1563,38 @@ class DictationDaemon:
 
     def get_batch_post_cmd(self) -> str:
         return shlex.join(self.batch_post_cmd) if self.batch_post_cmd else "raw"
+
+    def set_one_shot(self, rec_mode: str, post_cmd_str: str) -> str:
+        """Apply a temporary mode that auto-restores after the next completed transcription."""
+        if rec_mode not in ("batch", "streaming"):
+            return "one-shot requires rec_mode 'batch' or 'streaming'"
+        with self.lock:
+            self.one_shot_restore = {
+                "post_cmd": list(self.batch_post_cmd),
+                "streaming_mode": self.streaming_mode,
+            }
+        want_streaming = (rec_mode == "streaming")
+        if self.streaming_mode != want_streaming:
+            self.toggle_mode()
+        self.set_batch_post_cmd(post_cmd_str)
+        label = post_cmd_str.strip() or "raw"
+        log(f"One-shot mode set: {rec_mode}/{label}")
+        return f"One-shot: {label}"
+
+    def _maybe_restore_one_shot(self):
+        """If a one-shot mode was pending, restore the previous mode now."""
+        with self.lock:
+            restore = self.one_shot_restore
+            if restore is None:
+                return
+            self.one_shot_restore = None
+            self.batch_post_cmd = restore["post_cmd"]
+            want_streaming = restore["streaming_mode"]
+            self.streaming_mode = want_streaming
+        self._save_post_cmd()
+        restored_cmd = shlex.join(restore["post_cmd"]) if restore["post_cmd"] else "raw"
+        log(f"One-shot restored to: {restored_cmd}")
+        notify(f"↩ Restored: {restored_cmd}", "normal")
 
     def _run_post_processor(self, text: str) -> str:
         cmd = list(self.batch_post_cmd)
@@ -1694,6 +1732,15 @@ class DictationDaemon:
                         response = self.toggle_mode()
                     else:
                         response = f"Mode: {target}"
+            elif data.startswith("one-shot "):
+                rest = data[len("one-shot "):].strip()
+                parts = rest.split(" ", 1)
+                if len(parts) == 2:
+                    response = self.set_one_shot(parts[0], parts[1])
+                elif len(parts) == 1 and parts[0] in ("batch", "streaming"):
+                    response = self.set_one_shot(parts[0], "raw")
+                else:
+                    response = "Usage: one-shot <batch|streaming> <post_cmd>"
             elif data == "quit":
                 self.running = False
                 response = "Shutting down"
@@ -1874,10 +1921,22 @@ def main():
             sys.exit(1)
         response = send_command(f"set-mode {sys.argv[2]}")
         print(response)
+    elif cmd == "one-shot":
+        if not is_daemon_running():
+            print("Daemon not running. Start with: dictate-daemon.py start")
+            sys.exit(1)
+        if len(sys.argv) < 4:
+            print("Usage: dictate-daemon.py one-shot <batch|streaming> <post_cmd>")
+            sys.exit(1)
+        rec_mode = sys.argv[2]
+        post_cmd = " ".join(sys.argv[3:])
+        response = send_command(f"one-shot {rec_mode} {post_cmd}")
+        print(response)
     else:
         print(f"Usage: {sys.argv[0]} "
               f"[start|stop|toggle|mode|"
               f"set-mode <batch|streaming>|"
+              f"one-shot <batch|streaming> <post_cmd>|"
               f"post-cmd [raw|<wrapper> [args...]]|status]")
         sys.exit(1)
 
