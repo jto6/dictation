@@ -188,21 +188,26 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
-NSP_TRAILING_THRESHOLD = 0.35  # drop trailing segments with no_speech_prob >= this
+NSP_TRAILING_THRESHOLD = 0.60  # drop trailing segments with no_speech_prob >= this
+NSP_MAX_DROP_DURATION = 4.0   # never drop segments longer than this (real speech, not filler)
 
 def drop_trailing_high_nsp(segments: list) -> list:
     """Drop trailing segments with high no_speech_prob (Whisper hallucinations).
 
     When speech ends and there is trailing silence or noise, Whisper often
     emits short filler segments like 'Thanks.' or 'All right.' with elevated
-    no_speech_prob values (0.3–0.7).  Strip them from the tail, but keep at
-    least one segment so we never discard a single-segment transcription.
+    no_speech_prob values.  Strip them from the tail, but keep at least one
+    segment so we never discard a single-segment transcription.
+
+    Only drop segments that are short — long segments are real speech even if
+    Whisper assigns a high no_speech_prob.
     """
     cut = len(segments)
     while cut > 1:
         seg = segments[cut - 1]
         nsp = getattr(seg, 'no_speech_prob', 0.0)
-        if nsp >= NSP_TRAILING_THRESHOLD:
+        duration = seg.end - seg.start
+        if nsp >= NSP_TRAILING_THRESHOLD and duration <= NSP_MAX_DROP_DURATION:
             cut -= 1
         else:
             break
