@@ -188,7 +188,7 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
-NSP_TRAILING_THRESHOLD = 0.60  # drop trailing segments with no_speech_prob >= this
+NSP_TRAILING_THRESHOLD = 0.40  # drop trailing segments with no_speech_prob >= this
 NSP_MAX_DROP_DURATION = 4.0   # never drop segments longer than this (real speech, not filler)
 
 def drop_trailing_high_nsp(segments: list) -> list:
