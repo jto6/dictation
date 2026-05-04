@@ -1101,6 +1101,19 @@ class DictationDaemon:
         # before pasting so the user can switch windows during slow AI rewrites.
         self.target_window_id: str | None = None
 
+    def _transcribe_with_cpu_fallback(self, audio_file, **kwargs):
+        """Run model.transcribe, retrying on CPU if CUDA runs out of memory."""
+        try:
+            segments, info = self.model.transcribe(str(audio_file), **kwargs)
+            return list(segments), info
+        except Exception as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            log(f"CUDA OOM during transcription, retrying on CPU...")
+            cpu_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+            segments, info = cpu_model.transcribe(str(audio_file), **kwargs)
+            return list(segments), info
+
     def load_model(self):
         """Load Whisper model with auto-detection and fallback.
 
@@ -1267,8 +1280,8 @@ class DictationDaemon:
                     recent_context = self.previous_text[-100:].strip()
                     context_prompt = f"{INITIAL_PROMPT}\n{recent_context}"
 
-                segments, _ = self.model.transcribe(
-                    str(temp_file),
+                segments, _ = self._transcribe_with_cpu_fallback(
+                    temp_file,
                     beam_size=5,
                     language="en",
                     vad_filter=True,
@@ -1425,8 +1438,8 @@ class DictationDaemon:
 
         try:
             start = time.time()
-            segments, _ = self.model.transcribe(
-                str(AUDIO_FILE),
+            segments, _ = self._transcribe_with_cpu_fallback(
+                AUDIO_FILE,
                 beam_size=5,
                 language="en",
                 vad_filter=False,  # Don't discard any audio - user intentionally started recording
@@ -1434,7 +1447,6 @@ class DictationDaemon:
                 word_timestamps=True,  # Prevents skipping speech in long segments
                 hallucination_silence_threshold=None,  # Disabled: was dropping real speech after pauses
             )
-            segments = list(segments)
             if segments:
                 log(f"Segments: {len(segments)}, last ends at {segments[-1].end:.1f}s (audio: {duration:.1f}s)")
                 prev_end = 0.0
