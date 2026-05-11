@@ -146,6 +146,17 @@ def _read_claude_api_env() -> tuple[dict, str]:
 
     return env, node_bin_dir
 
+class _Segment:
+    """Lightweight segment wrapper used for gap-fill results with adjusted timestamps."""
+    __slots__ = ('start', 'end', 'text', 'no_speech_prob')
+
+    def __init__(self, start: float, end: float, text: str, no_speech_prob: float = 0.0):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.no_speech_prob = no_speech_prob
+
+
 # Common Whisper hallucinations (typically appear at end of transcription)
 # These are artifacts from YouTube training data
 # Common Whisper hallucination patterns (typically at end of transcription).
@@ -191,6 +202,10 @@ def normalize_whitespace(text: str) -> str:
 
 NSP_TRAILING_THRESHOLD = 0.40  # drop trailing segments with no_speech_prob >= this
 NSP_MAX_DROP_DURATION = 4.0   # never drop segments longer than this (real speech, not filler)
+
+GAP_INVESTIGATE_THRESHOLD = 5.0      # re-examine gaps longer than this (seconds)
+SPEECH_ACTIVITY_MIN_FRACTION = 0.20  # re-transcribe gap if >20% of windows have speech
+GAP_ANALYSIS_WINDOW_SECS = 0.1       # RMS window size for speech activity detection
 
 def drop_trailing_high_nsp(segments: list) -> list:
     """Drop trailing segments with high no_speech_prob (Whisper hallucinations).
@@ -1180,6 +1195,102 @@ class DictationDaemon:
 
         raise RuntimeError("Could not load model with any configuration")
 
+    def _fill_transcription_gaps(self, segments: list, audio: np.ndarray) -> list:
+        """Re-transcribe internal gaps where Whisper skipped over actual speech.
+
+        Whisper's attention mechanism can silently skip entire 30-second windows
+        when the content is dense or ambiguous. This method detects such gaps,
+        measures speech activity in the raw audio, and re-transcribes slices that
+        contain real speech. Long user pauses (silence) are left alone.
+        """
+        if len(segments) < 1:
+            return segments
+
+        # Gather gaps to investigate: (gap_start, gap_end, insert_before_index, prior_context)
+        gaps = []
+        if segments[0].start >= GAP_INVESTIGATE_THRESHOLD:
+            gaps.append((0.0, segments[0].start, 0, ""))
+        for i in range(1, len(segments)):
+            gap_start = segments[i - 1].end
+            gap_end = segments[i].start
+            if gap_end - gap_start >= GAP_INVESTIGATE_THRESHOLD:
+                context = segments[i - 1].text.strip()[-100:]
+                gaps.append((gap_start, gap_end, i, context))
+
+        if not gaps:
+            return segments
+
+        result = list(segments)
+        inserted = 0
+        window_samples = int(GAP_ANALYSIS_WINDOW_SECS * SAMPLE_RATE)
+
+        for gap_start, gap_end, insert_idx, context in gaps:
+            gap_duration = gap_end - gap_start
+            start_sample = int(gap_start * SAMPLE_RATE)
+            end_sample = int(gap_end * SAMPLE_RATE)
+            gap_audio = audio[start_sample:end_sample]
+
+            if window_samples == 0 or len(gap_audio) < window_samples:
+                continue
+
+            # Measure what fraction of the gap contains speech-level audio energy
+            total_windows = (len(gap_audio) - window_samples) // window_samples
+            speech_windows = sum(
+                1
+                for w in range(0, total_windows * window_samples, window_samples)
+                if np.sqrt(np.mean(gap_audio[w:w + window_samples] ** 2)) > SILENCE_THRESHOLD
+            )
+            speech_fraction = speech_windows / max(1, total_windows)
+
+            if speech_fraction < SPEECH_ACTIVITY_MIN_FRACTION:
+                log(f"Gap {gap_start:.1f}-{gap_end:.1f}s ({gap_duration:.1f}s): "
+                    f"{speech_fraction:.0%} speech activity → user pause, skipping")
+                continue
+
+            log(f"Gap {gap_start:.1f}-{gap_end:.1f}s ({gap_duration:.1f}s): "
+                f"{speech_fraction:.0%} speech activity → re-transcribing skipped audio")
+
+            # Provide the preceding segment as context so Whisper continues naturally
+            gap_prompt = f"{INITIAL_PROMPT}\n{context}" if context else INITIAL_PROMPT
+            gap_file = STATE_DIR / f"gap_{int(gap_start)}_{int(gap_end)}.wav"
+            try:
+                sf.write(str(gap_file), gap_audio, SAMPLE_RATE)
+                gap_segs, _ = self._transcribe_with_cpu_fallback(
+                    gap_file,
+                    beam_size=5,
+                    language="en",
+                    vad_filter=False,
+                    initial_prompt=gap_prompt,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                )
+                # Discard obvious hallucinations from the gap re-transcription
+                gap_segs = [s for s in gap_segs
+                            if s.text.strip() and getattr(s, 'no_speech_prob', 0.0) < 0.8]
+                if gap_segs:
+                    recovered = " ".join(s.text.strip() for s in gap_segs)
+                    log(f"Recovered {len(gap_segs)} segment(s) from gap: '{recovered[:120]}'")
+                    # Offset timestamps so downstream filters see absolute positions
+                    adjusted = [
+                        _Segment(
+                            start=gap_start + s.start,
+                            end=gap_start + s.end,
+                            text=s.text,
+                            no_speech_prob=getattr(s, 'no_speech_prob', 0.0),
+                        )
+                        for s in gap_segs
+                    ]
+                    result[insert_idx + inserted:insert_idx + inserted] = adjusted
+                    inserted += len(adjusted)
+                else:
+                    log(f"Gap re-transcription at {gap_start:.1f}s produced no usable output")
+            except Exception as e:
+                log(f"Gap re-transcription at {gap_start:.1f}s failed: {e}")
+            finally:
+                gap_file.unlink(missing_ok=True)
+
+        return result
+
     def audio_callback(self, indata, frames, time_info, status):
         """Audio stream callback."""
         if not self.recording:
@@ -1458,6 +1569,8 @@ class DictationDaemon:
                     nsp_flag = f" [nsp={nsp:.2f}]" if nsp is not None else ""
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
+                # Re-transcribe any large internal gaps where Whisper skipped speech
+                segments = self._fill_transcription_gaps(segments, audio)
                 # Drop trailing segments after long silence gaps (hallucinations from dead air).
                 # Only drop if the remaining speech is short - a long gap mid-dictation is just
                 # the user pausing to think, not dead air generating hallucinations.
