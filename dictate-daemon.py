@@ -1207,6 +1207,7 @@ class DictationDaemon:
             return segments
 
         # Gather gaps to investigate: (gap_start, gap_end, insert_before_index, prior_context)
+        audio_duration = len(audio) / SAMPLE_RATE
         gaps = []
         if segments[0].start >= GAP_INVESTIGATE_THRESHOLD:
             gaps.append((0.0, segments[0].start, 0, ""))
@@ -1216,6 +1217,11 @@ class DictationDaemon:
             if gap_end - gap_start >= GAP_INVESTIGATE_THRESHOLD:
                 context = segments[i - 1].text.strip()[-100:]
                 gaps.append((gap_start, gap_end, i, context))
+        # Trailing gap: Whisper can also skip the tail of a recording
+        trailing_gap = audio_duration - segments[-1].end
+        if trailing_gap >= GAP_INVESTIGATE_THRESHOLD:
+            context = segments[-1].text.strip()[-100:]
+            gaps.append((segments[-1].end, audio_duration, len(segments), context))
 
         if not gaps:
             return segments
