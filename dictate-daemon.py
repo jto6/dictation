@@ -224,6 +224,11 @@ def drop_trailing_high_nsp(segments: list) -> list:
         nsp = getattr(seg, 'no_speech_prob', 0.0)
         duration = seg.end - seg.start
         if nsp >= NSP_TRAILING_THRESHOLD and duration <= NSP_MAX_DROP_DURATION:
+            # If the preceding segment ends mid-sentence, this segment likely
+            # completes it — preserve it regardless of nsp.
+            prev_text = segments[cut - 2].text.strip()
+            if prev_text and prev_text[-1] not in '.!?':
+                break
             cut -= 1
         else:
             break
