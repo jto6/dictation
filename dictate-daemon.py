@@ -106,7 +106,8 @@ REPLACEMENTS = {
     "slash ": "/",  # Generic fallback for "slash X" → "/X"
     "npack": "NPAC",
     "SDV plus": "SDV+",
-    "TI-OVX": "TIOVX"
+    "TI-OVX": "TIOVX",
+    "Autosaur": "Autosar"
 }
 
 # Post-processing for batch transcription. Empty list = raw (no rewrite).
