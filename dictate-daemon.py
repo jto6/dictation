@@ -200,8 +200,8 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r' {2,}', ' ', text)
 
 
-NSP_TRAILING_THRESHOLD = 0.40  # drop trailing segments with no_speech_prob >= this
-NSP_MAX_DROP_DURATION = 4.0   # never drop segments longer than this (real speech, not filler)
+NSP_TRAILING_THRESHOLD = 0.80  # drop trailing segments with no_speech_prob >= this
+NSP_MAX_DROP_DURATION = 2.0   # never drop segments longer than this (real speech, not filler)
 
 GAP_INVESTIGATE_THRESHOLD = 5.0      # re-examine gaps longer than this (seconds)
 SPEECH_ACTIVITY_MIN_FRACTION = 0.20  # re-transcribe gap if >20% of windows have speech
