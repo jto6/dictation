@@ -107,7 +107,8 @@ REPLACEMENTS = {
     "npack": "NPAC",
     "SDV plus": "SDV+",
     "TI-OVX": "TIOVX",
-    "Autosaur": "Autosar"
+    "Autosaur": "Autosar",
+    "CAS": "kas"
 }
 
 # Post-processing for batch transcription. Empty list = raw (no rewrite).
