@@ -36,7 +36,20 @@ if [[ "$SESSION_TYPE" == "wayland" ]]; then
         fi
     fi
 
-    if command -v ydotool &> /dev/null; then
+    # The ydotoold daemon ships as a SEPARATE package on Debian/Ubuntu - the
+    # 'ydotool' package only provides the client. Without it, ydotool falls back
+    # to opening /dev/uinput per-call (slow, drops leading characters).
+    if ! command -v ydotoold &> /dev/null; then
+        echo "Warning: ydotoold not found (daemon needed for reliable typing on Wayland)"
+        echo "Install with: sudo apt install ydotoold"
+        read -p "Install ydotoold now? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            sudo apt install -y ydotoold
+        fi
+    fi
+
+    if command -v ydotool &> /dev/null && command -v ydotoold &> /dev/null; then
         echo "✓ ydotool found"
 
         # Check if ydotoold is running
@@ -84,6 +97,9 @@ if [[ "$SESSION_TYPE" == "wayland" ]]; then
         else
             echo "✓ ydotoold is running"
         fi
+    elif command -v ydotool &> /dev/null; then
+        echo "⚠ ydotool client is installed but the ydotoold daemon is missing."
+        echo "  Typing will be unreliable until you run: sudo apt install ydotoold"
     fi
     # Wayland - check for wl-clipboard (wl-copy)
     if ! command -v wl-copy &> /dev/null; then
