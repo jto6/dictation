@@ -1559,8 +1559,17 @@ class DictationDaemon:
 
         notify("⏹️ Transcribing...", "low")
 
-        # Save and transcribe
+        # Save raw audio immediately so it is never lost to a processing error
         sf.write(str(AUDIO_FILE), audio, SAMPLE_RATE)
+
+        # Pad with 0.5s of silence so Whisper finishes the final phrase before the audio ends.
+        # Match audio dimensions (mono=1D, stereo=2D).
+        silence_shape = (int(0.5 * SAMPLE_RATE),) + audio.shape[1:]
+        silence_pad = np.zeros(silence_shape, dtype=audio.dtype)
+        audio_padded = np.concatenate([audio, silence_pad])
+
+        # Re-write padded version for transcription
+        sf.write(str(AUDIO_FILE), audio_padded, SAMPLE_RATE)
 
         try:
             start = time.time()
