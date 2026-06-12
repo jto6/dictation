@@ -210,6 +210,7 @@ NSP_MAX_DROP_DURATION = 2.0   # never drop segments longer than this (real speec
 GAP_INVESTIGATE_THRESHOLD = 5.0      # re-examine gaps longer than this (seconds)
 SPEECH_ACTIVITY_MIN_FRACTION = 0.20  # re-transcribe gap if >20% of windows have speech
 GAP_ANALYSIS_WINDOW_SECS = 0.1       # RMS window size for speech activity detection
+COMPRESSION_RECOVERY_WINDOW = 4.0   # seconds of speech before each compression point to re-examine
 
 def compress_silence(audio: np.ndarray) -> tuple:
     """Shorten consecutive silence runs to at most MAX_SILENCE_KEEP seconds.
@@ -218,13 +219,17 @@ def compress_silence(audio: np.ndarray) -> tuple:
     pausing mid-dictation to look something up).  Speech segments and short
     pauses are left completely untouched.
 
-    Returns (compressed_audio, seconds_removed).
+    Returns (compressed_audio, seconds_removed, compression_points) where
+    compression_points is a list of positions (seconds) in the compressed audio
+    where each silence run starts — i.e. right after the last speech sample
+    before a compressed silence.  These are passed to the recovery pass so
+    Whisper can be asked to re-examine the speech right before each pause.
     """
     window = int(0.02 * SAMPLE_RATE)  # 20ms analysis windows
     max_keep = int(MAX_SILENCE_KEEP * SAMPLE_RATE)
     n_windows = len(audio) // window
     if n_windows == 0:
-        return audio, 0.0
+        return audio, 0.0, []
 
     rms = np.array([
         np.sqrt(np.mean(audio[i * window:(i + 1) * window] ** 2))
@@ -233,6 +238,8 @@ def compress_silence(audio: np.ndarray) -> tuple:
     is_silent = rms < SILENCE_THRESHOLD
 
     kept = []
+    compression_points = []
+    output_samples = 0
     i = 0
     while i < n_windows:
         if is_silent[i]:
@@ -240,10 +247,16 @@ def compress_silence(audio: np.ndarray) -> tuple:
             while j < n_windows and is_silent[j]:
                 j += 1
             silent_samples = (j - i) * window
-            kept.append(audio[i * window: i * window + min(silent_samples, max_keep)])
+            if silent_samples > max_keep:
+                compression_points.append(output_samples / SAMPLE_RATE)
+            chunk = audio[i * window: i * window + min(silent_samples, max_keep)]
+            kept.append(chunk)
+            output_samples += len(chunk)
             i = j
         else:
-            kept.append(audio[i * window: (i + 1) * window])
+            chunk = audio[i * window: (i + 1) * window]
+            kept.append(chunk)
+            output_samples += len(chunk)
             i += 1
 
     remainder = audio[n_windows * window:]
@@ -252,7 +265,7 @@ def compress_silence(audio: np.ndarray) -> tuple:
 
     compressed = np.concatenate(kept) if kept else audio.copy()
     removed = (len(audio) - len(compressed)) / SAMPLE_RATE
-    return compressed, removed
+    return compressed, removed, compression_points
 
 
 def drop_trailing_high_nsp(segments: list) -> list:
@@ -1350,6 +1363,91 @@ class DictationDaemon:
 
         return result
 
+    def _recover_at_compression_points(self, segments: list, audio_tc: np.ndarray,
+                                        compression_points: list) -> list:
+        """Re-transcribe the speech immediately before each compression point.
+
+        Whisper sometimes drops trailing words at the end of a speech run right
+        before a long pause.  For every point where silence was compressed, take
+        the last COMPRESSION_RECOVERY_WINDOW seconds of audio before the silence
+        and re-transcribe it in isolation.  Any words recovered beyond what the
+        existing segments already captured are inserted; remove_segment_overlaps
+        handles deduplication of the overlapping prefix.
+        """
+        if not compression_points or not segments:
+            return segments
+
+        result = list(segments)
+        window_samples = int(GAP_ANALYSIS_WINDOW_SECS * SAMPLE_RATE)
+
+        for cp in compression_points:
+            win_start = max(0.0, cp - COMPRESSION_RECOVERY_WINDOW)
+            win_end = cp
+            win_audio = audio_tc[int(win_start * SAMPLE_RATE):int(win_end * SAMPLE_RATE)]
+
+            if len(win_audio) < window_samples:
+                continue
+
+            # Skip if the window is mostly silence (nothing useful to recover)
+            total_windows = len(win_audio) // window_samples
+            speech_windows = sum(
+                1
+                for w in range(0, total_windows * window_samples, window_samples)
+                if np.sqrt(np.mean(win_audio[w:w + window_samples] ** 2)) > SILENCE_THRESHOLD
+            )
+            if speech_windows / max(1, total_windows) < SPEECH_ACTIVITY_MIN_FRACTION:
+                continue
+
+            # Use the last segment before cp for transcription context
+            context = ""
+            for s in result:
+                if s.start < cp:
+                    context = s.text.strip()[-100:]
+            recovery_prompt = f"{INITIAL_PROMPT}\n{context}" if context else INITIAL_PROMPT
+
+            log(f"Compression point at {cp:.1f}s: re-transcribing {win_start:.1f}-{win_end:.1f}s")
+            recovery_file = STATE_DIR / f"recovery_{int(cp * 10)}.wav"
+            try:
+                sf.write(str(recovery_file), win_audio, SAMPLE_RATE)
+                rec_segs, _ = self._transcribe_with_cpu_fallback(
+                    recovery_file,
+                    beam_size=5,
+                    language="en",
+                    vad_filter=False,
+                    initial_prompt=recovery_prompt,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                )
+                rec_segs = [s for s in rec_segs
+                            if s.text.strip() and getattr(s, 'no_speech_prob', 0.0) < 0.8]
+                if rec_segs:
+                    recovered = " ".join(s.text.strip() for s in rec_segs)
+                    log(f"  recovered: '{recovered[:120]}'")
+                    adjusted = [
+                        _Segment(
+                            start=win_start + s.start,
+                            end=win_start + s.end,
+                            text=s.text,
+                            no_speech_prob=getattr(s, 'no_speech_prob', 0.0),
+                        )
+                        for s in rec_segs
+                    ]
+                    # Insert after the last segment whose start precedes cp
+                    insert_pos = len(result)
+                    for k in range(len(result) - 1, -1, -1):
+                        if result[k].start < cp:
+                            insert_pos = k + 1
+                            break
+                    result[insert_pos:insert_pos] = adjusted
+                else:
+                    log(f"  recovery produced no usable output")
+            except Exception as e:
+                log(f"Recovery re-transcription at {cp:.1f}s failed: {e}")
+            finally:
+                recovery_file.unlink(missing_ok=True)
+
+        return result
+
     def audio_callback(self, indata, frames, time_info, status):
         """Audio stream callback."""
         if not self.recording:
@@ -1609,7 +1707,7 @@ class DictationDaemon:
 
         # Compress long silence runs so Whisper doesn't hallucinate over dead air
         # (e.g. user pausing mid-dictation to look something up).
-        audio_tc, silence_removed = compress_silence(audio)
+        audio_tc, silence_removed, compression_points = compress_silence(audio)
         if silence_removed > 0.1:
             log(f"Compressed {silence_removed:.1f}s of silence (capped runs at {MAX_SILENCE_KEEP:.1f}s)")
 
@@ -1645,6 +1743,9 @@ class DictationDaemon:
                     prev_end = seg.end
                 # Re-transcribe any large internal gaps where Whisper skipped speech
                 segments = self._fill_transcription_gaps(segments, audio_tc)
+                # Re-transcribe speech right before each compressed silence to recover
+                # words Whisper dropped at the end of a segment before a long pause
+                segments = self._recover_at_compression_points(segments, audio_tc, compression_points)
             # Drop segments where word rate is physically impossible (Whisper hallucination).
             # Normal max speech is ~5 words/sec; hallucinated filler appears at 8-15 words/sec.
             # Only apply to segments with >=3 words to avoid false positives on short real utterances.
