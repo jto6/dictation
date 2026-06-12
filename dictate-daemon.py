@@ -47,6 +47,7 @@ AUDIO_DEVICE = None
 # Streaming mode settings
 SILENCE_THRESHOLD = 0.01  # RMS threshold for silence detection
 SILENCE_DURATION = 0.7    # Seconds of silence to trigger phrase transcription
+MAX_SILENCE_KEEP = 1.0    # Compress silence runs longer than this before transcription
 MIN_PHRASE_DURATION = 0.3 # Minimum audio duration to transcribe
 PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
@@ -209,6 +210,50 @@ NSP_MAX_DROP_DURATION = 2.0   # never drop segments longer than this (real speec
 GAP_INVESTIGATE_THRESHOLD = 5.0      # re-examine gaps longer than this (seconds)
 SPEECH_ACTIVITY_MIN_FRACTION = 0.20  # re-transcribe gap if >20% of windows have speech
 GAP_ANALYSIS_WINDOW_SECS = 0.1       # RMS window size for speech activity detection
+
+def compress_silence(audio: np.ndarray) -> tuple:
+    """Shorten consecutive silence runs to at most MAX_SILENCE_KEEP seconds.
+
+    Prevents Whisper from hallucinating over long silent stretches (e.g. user
+    pausing mid-dictation to look something up).  Speech segments and short
+    pauses are left completely untouched.
+
+    Returns (compressed_audio, seconds_removed).
+    """
+    window = int(0.02 * SAMPLE_RATE)  # 20ms analysis windows
+    max_keep = int(MAX_SILENCE_KEEP * SAMPLE_RATE)
+    n_windows = len(audio) // window
+    if n_windows == 0:
+        return audio, 0.0
+
+    rms = np.array([
+        np.sqrt(np.mean(audio[i * window:(i + 1) * window] ** 2))
+        for i in range(n_windows)
+    ])
+    is_silent = rms < SILENCE_THRESHOLD
+
+    kept = []
+    i = 0
+    while i < n_windows:
+        if is_silent[i]:
+            j = i
+            while j < n_windows and is_silent[j]:
+                j += 1
+            silent_samples = (j - i) * window
+            kept.append(audio[i * window: i * window + min(silent_samples, max_keep)])
+            i = j
+        else:
+            kept.append(audio[i * window: (i + 1) * window])
+            i += 1
+
+    remainder = audio[n_windows * window:]
+    if len(remainder) > 0:
+        kept.append(remainder)
+
+    compressed = np.concatenate(kept) if kept else audio.copy()
+    removed = (len(audio) - len(compressed)) / SAMPLE_RATE
+    return compressed, removed
+
 
 def drop_trailing_high_nsp(segments: list) -> list:
     """Drop trailing segments with high no_speech_prob (Whisper hallucinations).
@@ -1562,11 +1607,17 @@ class DictationDaemon:
         # Save raw audio immediately so it is never lost to a processing error
         sf.write(str(AUDIO_FILE), audio, SAMPLE_RATE)
 
+        # Compress long silence runs so Whisper doesn't hallucinate over dead air
+        # (e.g. user pausing mid-dictation to look something up).
+        audio_tc, silence_removed = compress_silence(audio)
+        if silence_removed > 0.1:
+            log(f"Compressed {silence_removed:.1f}s of silence (capped runs at {MAX_SILENCE_KEEP:.1f}s)")
+
         # Pad with 0.5s of silence so Whisper finishes the final phrase before the audio ends.
         # Match audio dimensions (mono=1D, stereo=2D).
-        silence_shape = (int(0.5 * SAMPLE_RATE),) + audio.shape[1:]
-        silence_pad = np.zeros(silence_shape, dtype=audio.dtype)
-        audio_padded = np.concatenate([audio, silence_pad])
+        silence_shape = (int(0.5 * SAMPLE_RATE),) + audio_tc.shape[1:]
+        silence_pad = np.zeros(silence_shape, dtype=audio_tc.dtype)
+        audio_padded = np.concatenate([audio_tc, silence_pad])
 
         # Re-write padded version for transcription
         sf.write(str(AUDIO_FILE), audio_padded, SAMPLE_RATE)
@@ -1593,34 +1644,7 @@ class DictationDaemon:
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
                 # Re-transcribe any large internal gaps where Whisper skipped speech
-                segments = self._fill_transcription_gaps(segments, audio)
-                # Drop trailing segments after long silence gaps (hallucinations from dead air).
-                # Only drop if the remaining speech is short - a long gap mid-dictation is just
-                # the user pausing to think, not dead air generating hallucinations.
-                SILENCE_GAP_THRESHOLD = 12.0   # seconds
-                MAX_TRAILING_SPEECH = 20.0     # don't drop if > this many seconds of speech follow the gap
-                prev_end = 0.0
-                trim_idx = None
-                trim_gap = 0.0
-                for i, seg in enumerate(segments):
-                    gap = seg.start - prev_end
-                    if i > 0 and gap >= SILENCE_GAP_THRESHOLD:
-                        trailing_duration = segments[-1].end - seg.start
-                        prev_text = segments[i - 1].text.strip()
-                        prev_ends_mid_sentence = prev_text and prev_text[-1] not in '.!?'
-                        if prev_ends_mid_sentence:
-                            log(f"Skipping silence gap filter: {gap:.1f}s gap at seg {i} but previous segment is mid-sentence")
-                        elif trailing_duration <= MAX_TRAILING_SPEECH:
-                            trim_idx = i
-                            trim_gap = gap
-                            break
-                        else:
-                            log(f"Skipping silence gap filter: {gap:.1f}s gap at seg {i} but {trailing_duration:.1f}s of speech follows")
-                    prev_end = seg.end
-                if trim_idx is not None:
-                    dropped = " ".join(s.text.strip() for s in segments[trim_idx:])
-                    log(f"Dropped {len(segments) - trim_idx} trailing segment(s) after {trim_gap:.1f}s silence gap: '{dropped}'")
-                    segments = segments[:trim_idx]
+                segments = self._fill_transcription_gaps(segments, audio_tc)
             # Drop segments where word rate is physically impossible (Whisper hallucination).
             # Normal max speech is ~5 words/sec; hallucinated filler appears at 8-15 words/sec.
             # Only apply to segments with >=3 words to avoid false positives on short real utterances.
