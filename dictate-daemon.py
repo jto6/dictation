@@ -37,7 +37,7 @@ CHANNELS = 1
 # Set to specific values to override auto-detection
 MODEL_SIZE = "medium.en"  # "auto", "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
 DEVICE = "auto"  # "auto", "cuda", or "cpu"
-COMPUTE_TYPE = "auto"  # "auto", "float16", "float32", "int8"
+COMPUTE_TYPE = "auto"  # "auto", "int8_float16", "float16", "float32", "int8" (auto picks int8_float16 on GPU)
 
 # Audio input device - set to None for system default, or device name/index
 # Use `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices
@@ -47,8 +47,18 @@ AUDIO_DEVICE = None
 # Streaming mode settings
 SILENCE_THRESHOLD = 0.01  # RMS threshold for silence detection
 SILENCE_DURATION = 0.7    # Seconds of silence to trigger phrase transcription
-MAX_SILENCE_KEEP = 1.0    # Compress silence runs longer than this before transcription
 MIN_PHRASE_DURATION = 0.3 # Minimum audio duration to transcribe
+
+# Long-pause compression (batch mode). Normal speech pauses (the natural rhythm
+# between phrases and sentences) are left COMPLETELY untouched — re-timing them
+# degrades transcription, since Whisper relies on natural cadence and a loudness
+# threshold clips the quiet edges of real words. Only genuinely long dead-air
+# gaps (you stepped away, stopped to read something) are collapsed, because
+# Whisper can hallucinate text over long stretches of silence. We cut only from
+# the MIDDLE of such a gap, keeping a generous margin of real silence on each
+# side, so no word edge is ever touched and no click is introduced.
+LONG_PAUSE_TRIGGER = 8.0  # only compress silence runs LONGER than this (seconds)
+LONG_PAUSE_KEEP = 2.0     # collapse such runs down to this many seconds
 PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
 # Whisper prompt to bias toward technical/programming vocabulary
@@ -150,16 +160,6 @@ def _read_claude_api_env() -> tuple[dict, str]:
 
     return env, node_bin_dir
 
-class _Segment:
-    """Lightweight segment wrapper used for gap-fill results with adjusted timestamps."""
-    __slots__ = ('start', 'end', 'text', 'no_speech_prob')
-
-    def __init__(self, start: float, end: float, text: str, no_speech_prob: float = 0.0):
-        self.start = start
-        self.end = end
-        self.text = text
-        self.no_speech_prob = no_speech_prob
-
 
 # Common Whisper hallucinations (typically appear at end of transcription)
 # These are artifacts from YouTube training data
@@ -195,7 +195,8 @@ SOCKET_PATH = STATE_DIR / "daemon.sock"
 PID_FILE = STATE_DIR / "daemon.pid"
 LOG_FILE = STATE_DIR / "daemon.log"
 AUDIO_FILE = STATE_DIR / "recording.wav"
-LAST_AUDIO_FILE = STATE_DIR / "last-recording.wav"
+LAST_AUDIO_FILE = STATE_DIR / "last-recording.wav"        # compressed+padded audio sent to Whisper
+LAST_RAW_AUDIO_FILE = STATE_DIR / "last-recording-raw.wav"  # original uncompressed audio (for debugging)
 POST_CMD_FILE = STATE_DIR / "batch-post-cmd"
 
 
@@ -207,26 +208,29 @@ def normalize_whitespace(text: str) -> str:
 NSP_TRAILING_THRESHOLD = 0.80  # drop trailing segments with no_speech_prob >= this
 NSP_MAX_DROP_DURATION = 2.0   # never drop segments longer than this (real speech, not filler)
 
-GAP_INVESTIGATE_THRESHOLD = 5.0      # re-examine gaps longer than this (seconds)
-SPEECH_ACTIVITY_MIN_FRACTION = 0.20  # re-transcribe gap if >20% of windows have speech
-GAP_ANALYSIS_WINDOW_SECS = 0.1       # RMS window size for speech activity detection
-COMPRESSION_RECOVERY_WINDOW = 4.0   # seconds of speech before each compression point to re-examine
-
 def compress_silence(audio: np.ndarray) -> tuple:
-    """Shorten consecutive silence runs to at most MAX_SILENCE_KEEP seconds.
+    """Collapse only genuinely long dead-air gaps; leave normal speech untouched.
 
-    Prevents Whisper from hallucinating over long silent stretches (e.g. user
-    pausing mid-dictation to look something up).  Speech segments and short
-    pauses are left completely untouched.
+    A silence run is compressed only if it is longer than LONG_PAUSE_TRIGGER
+    (i.e. you stepped away or stopped to read), in which case it is shortened to
+    LONG_PAUSE_KEEP seconds.  Every shorter pause — the natural rhythm between
+    phrases and sentences — is passed through verbatim, because re-timing normal
+    speech degrades transcription (Whisper relies on natural cadence, and the
+    RMS threshold clips the quiet edges of real words).
 
-    Returns (compressed_audio, seconds_removed, compression_points) where
-    compression_points is a list of positions (seconds) in the compressed audio
-    where each silence run starts — i.e. right after the last speech sample
-    before a compressed silence.  These are passed to the recovery pass so
-    Whisper can be asked to re-examine the speech right before each pause.
+    When a long gap is collapsed we keep half of LONG_PAUSE_KEEP at each end and
+    drop only the middle.  The kept margins (~1s each side) far exceed any word's
+    quiet onset/offset, so no speech edge is ever touched and the cut sits in
+    truly silent audio (no click).
+
+    Returns (compressed_audio, seconds_removed, compression_events) where each
+    event is {raw_start, raw_end, comp_pos, removed} (seconds): raw_start/raw_end
+    bracket the gap in the original audio, comp_pos is where the shortened gap
+    begins in the compressed audio, and removed is how much silence was dropped.
     """
     window = int(0.02 * SAMPLE_RATE)  # 20ms analysis windows
-    max_keep = int(MAX_SILENCE_KEEP * SAMPLE_RATE)
+    trigger = int(LONG_PAUSE_TRIGGER * SAMPLE_RATE)
+    keep = int(LONG_PAUSE_KEEP * SAMPLE_RATE)
     n_windows = len(audio) // window
     if n_windows == 0:
         return audio, 0.0, []
@@ -238,7 +242,7 @@ def compress_silence(audio: np.ndarray) -> tuple:
     is_silent = rms < SILENCE_THRESHOLD
 
     kept = []
-    compression_points = []
+    compression_events = []
     output_samples = 0
     i = 0
     while i < n_windows:
@@ -247,9 +251,25 @@ def compress_silence(audio: np.ndarray) -> tuple:
             while j < n_windows and is_silent[j]:
                 j += 1
             silent_samples = (j - i) * window
-            if silent_samples > max_keep:
-                compression_points.append(output_samples / SAMPLE_RATE)
-            chunk = audio[i * window: i * window + min(silent_samples, max_keep)]
+            run_start = i * window
+            run_end = j * window
+            if silent_samples > trigger:
+                # Long dead-air gap: keep keep/2 at each end, drop the middle.
+                head = keep // 2
+                tail = keep - head
+                chunk = np.concatenate([
+                    audio[run_start: run_start + head],
+                    audio[run_end - tail: run_end],
+                ])
+                compression_events.append({
+                    "raw_start": run_start / SAMPLE_RATE,
+                    "raw_end": run_end / SAMPLE_RATE,
+                    "comp_pos": output_samples / SAMPLE_RATE,
+                    "removed": (silent_samples - keep) / SAMPLE_RATE,
+                })
+            else:
+                # Normal pause — pass through untouched.
+                chunk = audio[run_start: run_end]
             kept.append(chunk)
             output_samples += len(chunk)
             i = j
@@ -265,7 +285,7 @@ def compress_silence(audio: np.ndarray) -> tuple:
 
     compressed = np.concatenate(kept) if kept else audio.copy()
     removed = (len(audio) - len(compressed)) / SAMPLE_RATE
-    return compressed, removed, compression_points
+    return compressed, removed, compression_events
 
 
 def drop_trailing_high_nsp(segments: list) -> list:
@@ -1092,9 +1112,10 @@ def detect_best_config():
         if device == "cpu":
             compute_type = "int8"  # Best for CPU
         else:
-            # For CUDA, test which compute types actually work
-            # Some GPUs/drivers have issues with float16
-            compute_type = "float16"  # Try float16 first
+            # For CUDA, prefer int8_float16: same speed as float16 but more
+            # robust beam-search decisions. Observed float16 (and even float32)
+            # silently dropping a phrase around a pause that int8_float16 keeps.
+            compute_type = "int8_float16"
 
     # Determine model size based on available VRAM (not total)
     if model_size == "auto":
@@ -1217,8 +1238,9 @@ class DictationDaemon:
             model_chain = get_model_fallback_chain(model_size)
 
             for model_name in model_chain:
-                # For each model, try float16 then float32
-                for ct in ["float16", "float32"]:
+                # int8_float16 first (same speed as float16, fewer dropped words),
+                # then float16, then float32 as compatibility fallbacks.
+                for ct in ["int8_float16", "float16", "float32"]:
                     try:
                         log(f"Trying {model_name} on cuda/{ct}...")
                         model = WhisperModel(model_name, device="cuda", compute_type=ct)
@@ -1260,193 +1282,6 @@ class DictationDaemon:
                 log(f"Failed to load model: {e}")
 
         raise RuntimeError("Could not load model with any configuration")
-
-    def _fill_transcription_gaps(self, segments: list, audio: np.ndarray) -> list:
-        """Re-transcribe internal gaps where Whisper skipped over actual speech.
-
-        Whisper's attention mechanism can silently skip entire 30-second windows
-        when the content is dense or ambiguous. This method detects such gaps,
-        measures speech activity in the raw audio, and re-transcribes slices that
-        contain real speech. Long user pauses (silence) are left alone.
-        """
-        if len(segments) < 1:
-            return segments
-
-        # Gather gaps to investigate: (gap_start, gap_end, insert_before_index, prior_context)
-        audio_duration = len(audio) / SAMPLE_RATE
-        gaps = []
-        if segments[0].start >= GAP_INVESTIGATE_THRESHOLD:
-            gaps.append((0.0, segments[0].start, 0, ""))
-        for i in range(1, len(segments)):
-            gap_start = segments[i - 1].end
-            gap_end = segments[i].start
-            if gap_end - gap_start >= GAP_INVESTIGATE_THRESHOLD:
-                context = segments[i - 1].text.strip()[-100:]
-                gaps.append((gap_start, gap_end, i, context))
-        # Trailing gap: Whisper can also skip the tail of a recording
-        trailing_gap = audio_duration - segments[-1].end
-        if trailing_gap >= GAP_INVESTIGATE_THRESHOLD:
-            context = segments[-1].text.strip()[-100:]
-            gaps.append((segments[-1].end, audio_duration, len(segments), context))
-
-        if not gaps:
-            return segments
-
-        result = list(segments)
-        inserted = 0
-        window_samples = int(GAP_ANALYSIS_WINDOW_SECS * SAMPLE_RATE)
-
-        for gap_start, gap_end, insert_idx, context in gaps:
-            gap_duration = gap_end - gap_start
-            start_sample = int(gap_start * SAMPLE_RATE)
-            end_sample = int(gap_end * SAMPLE_RATE)
-            gap_audio = audio[start_sample:end_sample]
-
-            if window_samples == 0 or len(gap_audio) < window_samples:
-                continue
-
-            # Measure what fraction of the gap contains speech-level audio energy
-            total_windows = (len(gap_audio) - window_samples) // window_samples
-            speech_windows = sum(
-                1
-                for w in range(0, total_windows * window_samples, window_samples)
-                if np.sqrt(np.mean(gap_audio[w:w + window_samples] ** 2)) > SILENCE_THRESHOLD
-            )
-            speech_fraction = speech_windows / max(1, total_windows)
-
-            if speech_fraction < SPEECH_ACTIVITY_MIN_FRACTION:
-                log(f"Gap {gap_start:.1f}-{gap_end:.1f}s ({gap_duration:.1f}s): "
-                    f"{speech_fraction:.0%} speech activity → user pause, skipping")
-                continue
-
-            log(f"Gap {gap_start:.1f}-{gap_end:.1f}s ({gap_duration:.1f}s): "
-                f"{speech_fraction:.0%} speech activity → re-transcribing skipped audio")
-
-            # Provide the preceding segment as context so Whisper continues naturally
-            gap_prompt = f"{INITIAL_PROMPT}\n{context}" if context else INITIAL_PROMPT
-            gap_file = STATE_DIR / f"gap_{int(gap_start)}_{int(gap_end)}.wav"
-            try:
-                sf.write(str(gap_file), gap_audio, SAMPLE_RATE)
-                gap_segs, _ = self._transcribe_with_cpu_fallback(
-                    gap_file,
-                    beam_size=5,
-                    language="en",
-                    vad_filter=False,
-                    initial_prompt=gap_prompt,
-                    word_timestamps=True,
-                    condition_on_previous_text=False,
-                )
-                # Discard obvious hallucinations from the gap re-transcription
-                gap_segs = [s for s in gap_segs
-                            if s.text.strip() and getattr(s, 'no_speech_prob', 0.0) < 0.8]
-                if gap_segs:
-                    recovered = " ".join(s.text.strip() for s in gap_segs)
-                    log(f"Recovered {len(gap_segs)} segment(s) from gap: '{recovered[:120]}'")
-                    # Offset timestamps so downstream filters see absolute positions
-                    adjusted = [
-                        _Segment(
-                            start=gap_start + s.start,
-                            end=gap_start + s.end,
-                            text=s.text,
-                            no_speech_prob=getattr(s, 'no_speech_prob', 0.0),
-                        )
-                        for s in gap_segs
-                    ]
-                    result[insert_idx + inserted:insert_idx + inserted] = adjusted
-                    inserted += len(adjusted)
-                else:
-                    log(f"Gap re-transcription at {gap_start:.1f}s produced no usable output")
-            except Exception as e:
-                log(f"Gap re-transcription at {gap_start:.1f}s failed: {e}")
-            finally:
-                gap_file.unlink(missing_ok=True)
-
-        return result
-
-    def _recover_at_compression_points(self, segments: list, audio_tc: np.ndarray,
-                                        compression_points: list) -> list:
-        """Re-transcribe the speech immediately before each compression point.
-
-        Whisper sometimes drops trailing words at the end of a speech run right
-        before a long pause.  For every point where silence was compressed, take
-        the last COMPRESSION_RECOVERY_WINDOW seconds of audio before the silence
-        and re-transcribe it in isolation.  Any words recovered beyond what the
-        existing segments already captured are inserted; remove_segment_overlaps
-        handles deduplication of the overlapping prefix.
-        """
-        if not compression_points or not segments:
-            return segments
-
-        result = list(segments)
-        window_samples = int(GAP_ANALYSIS_WINDOW_SECS * SAMPLE_RATE)
-
-        for cp in compression_points:
-            win_start = max(0.0, cp - COMPRESSION_RECOVERY_WINDOW)
-            win_end = cp
-            win_audio = audio_tc[int(win_start * SAMPLE_RATE):int(win_end * SAMPLE_RATE)]
-
-            if len(win_audio) < window_samples:
-                continue
-
-            # Skip if the window is mostly silence (nothing useful to recover)
-            total_windows = len(win_audio) // window_samples
-            speech_windows = sum(
-                1
-                for w in range(0, total_windows * window_samples, window_samples)
-                if np.sqrt(np.mean(win_audio[w:w + window_samples] ** 2)) > SILENCE_THRESHOLD
-            )
-            if speech_windows / max(1, total_windows) < SPEECH_ACTIVITY_MIN_FRACTION:
-                continue
-
-            # Use the last segment before cp for transcription context
-            context = ""
-            for s in result:
-                if s.start < cp:
-                    context = s.text.strip()[-100:]
-            recovery_prompt = f"{INITIAL_PROMPT}\n{context}" if context else INITIAL_PROMPT
-
-            log(f"Compression point at {cp:.1f}s: re-transcribing {win_start:.1f}-{win_end:.1f}s")
-            recovery_file = STATE_DIR / f"recovery_{int(cp * 10)}.wav"
-            try:
-                sf.write(str(recovery_file), win_audio, SAMPLE_RATE)
-                rec_segs, _ = self._transcribe_with_cpu_fallback(
-                    recovery_file,
-                    beam_size=5,
-                    language="en",
-                    vad_filter=False,
-                    initial_prompt=recovery_prompt,
-                    word_timestamps=True,
-                    condition_on_previous_text=False,
-                )
-                rec_segs = [s for s in rec_segs
-                            if s.text.strip() and getattr(s, 'no_speech_prob', 0.0) < 0.8]
-                if rec_segs:
-                    recovered = " ".join(s.text.strip() for s in rec_segs)
-                    log(f"  recovered: '{recovered[:120]}'")
-                    adjusted = [
-                        _Segment(
-                            start=win_start + s.start,
-                            end=win_start + s.end,
-                            text=s.text,
-                            no_speech_prob=getattr(s, 'no_speech_prob', 0.0),
-                        )
-                        for s in rec_segs
-                    ]
-                    # Insert after the last segment whose start precedes cp
-                    insert_pos = len(result)
-                    for k in range(len(result) - 1, -1, -1):
-                        if result[k].start < cp:
-                            insert_pos = k + 1
-                            break
-                    result[insert_pos:insert_pos] = adjusted
-                else:
-                    log(f"  recovery produced no usable output")
-            except Exception as e:
-                log(f"Recovery re-transcription at {cp:.1f}s failed: {e}")
-            finally:
-                recovery_file.unlink(missing_ok=True)
-
-        return result
 
     def audio_callback(self, indata, frames, time_info, status):
         """Audio stream callback."""
@@ -1702,14 +1537,28 @@ class DictationDaemon:
 
         notify("⏹️ Transcribing...", "low")
 
-        # Save raw audio immediately so it is never lost to a processing error
+        # Save raw audio immediately so it is never lost to a processing error.
+        # Also keep a persistent copy of the uncompressed original for debugging
+        # (AUDIO_FILE gets overwritten below with the compressed+padded version).
         sf.write(str(AUDIO_FILE), audio, SAMPLE_RATE)
+        sf.write(str(LAST_RAW_AUDIO_FILE), audio, SAMPLE_RATE)
 
-        # Compress long silence runs so Whisper doesn't hallucinate over dead air
-        # (e.g. user pausing mid-dictation to look something up).
-        audio_tc, silence_removed, compression_points = compress_silence(audio)
+        # Collapse only genuinely long dead-air gaps (>LONG_PAUSE_TRIGGER) so
+        # Whisper doesn't hallucinate over them; normal speech pauses are left
+        # untouched (re-timing them degrades transcription).
+        audio_tc, silence_removed, compression_events = compress_silence(audio)
         if silence_removed > 0.1:
-            log(f"Compressed {silence_removed:.1f}s of silence (capped runs at {MAX_SILENCE_KEEP:.1f}s)")
+            log(f"Compressed {silence_removed:.1f}s of dead air "
+                f"(gaps >{LONG_PAUSE_TRIGGER:.0f}s collapsed to {LONG_PAUSE_KEEP:.0f}s)")
+            # Map each compressed silence run across both timelines so a "missing
+            # speech at Ns" report can be traced in raw vs. compressed audio.
+            for ev in compression_events:
+                log(
+                    f"  silence run: raw {ev['raw_start']:.1f}-{ev['raw_end']:.1f}s "
+                    f"({ev['raw_end'] - ev['raw_start']:.1f}s) → compressed at "
+                    f"{ev['comp_pos']:.1f}s (-{ev['removed']:.1f}s); "
+                    f"raw t>{ev['raw_end']:.1f}s maps to compressed t-{ev['removed']:.1f}s onward"
+                )
 
         # Pad with 0.5s of silence so Whisper finishes the final phrase before the audio ends.
         # Match audio dimensions (mono=1D, stereo=2D).
@@ -1741,11 +1590,6 @@ class DictationDaemon:
                     nsp_flag = f" [nsp={nsp:.2f}]" if nsp is not None else ""
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
-                # Re-transcribe any large internal gaps where Whisper skipped speech
-                segments = self._fill_transcription_gaps(segments, audio_tc)
-                # Re-transcribe speech right before each compressed silence to recover
-                # words Whisper dropped at the end of a segment before a long pause
-                segments = self._recover_at_compression_points(segments, audio_tc, compression_points)
             # Drop segments where word rate is physically impossible (Whisper hallucination).
             # Normal max speech is ~5 words/sec; hallucinated filler appears at 8-15 words/sec.
             # Only apply to segments with >=3 words to avoid false positives on short real utterances.
