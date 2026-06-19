@@ -49,6 +49,13 @@ SILENCE_THRESHOLD = 0.01  # RMS threshold for silence detection
 SILENCE_DURATION = 0.7    # Seconds of silence to trigger phrase transcription
 MIN_PHRASE_DURATION = 0.3 # Minimum audio duration to transcribe
 
+# Mic gain normalization. Quiet mics (peak < NORMALIZE_THRESHOLD) have their
+# speech RMS fall below SILENCE_THRESHOLD, which makes compress_silence treat
+# an entire recording as dead air and collapse it. Normalize before processing
+# when the peak is below this fraction of full scale.
+NORMALIZE_THRESHOLD = 0.3  # apply gain if peak amplitude is below this
+NORMALIZE_TARGET = 0.7     # scale peak up to this value
+
 # Long-pause compression (batch mode). Normal speech pauses (the natural rhythm
 # between phrases and sentences) are left COMPLETELY untouched — re-timing them
 # degrades transcription, since Whisper relies on natural cadence and a loudness
@@ -207,6 +214,19 @@ def normalize_whitespace(text: str) -> str:
 
 NSP_TRAILING_THRESHOLD = 0.80  # drop trailing segments with no_speech_prob >= this
 NSP_MAX_DROP_DURATION = 2.0   # never drop segments longer than this (real speech, not filler)
+
+def normalize_audio(audio: np.ndarray) -> tuple:
+    """Apply gain if the recording is too quiet for silence detection to work.
+
+    Returns (normalized_audio, gain_applied). gain_applied is 1.0 when no
+    adjustment was made.
+    """
+    peak = float(np.max(np.abs(audio)))
+    if peak < NORMALIZE_THRESHOLD and peak > 0:
+        gain = NORMALIZE_TARGET / peak
+        return (audio * gain).astype(audio.dtype), gain
+    return audio, 1.0
+
 
 def compress_silence(audio: np.ndarray) -> tuple:
     """Collapse only genuinely long dead-air gaps; leave normal speech untouched.
@@ -1370,6 +1390,8 @@ class DictationDaemon:
             if duration < MIN_PHRASE_DURATION:
                 continue
 
+            audio, _ = normalize_audio(audio)
+
             # Save and transcribe
             temp_file = STATE_DIR / f"phrase_{time.time()}.wav"
             try:
@@ -1542,6 +1564,13 @@ class DictationDaemon:
         # (AUDIO_FILE gets overwritten below with the compressed+padded version).
         sf.write(str(AUDIO_FILE), audio, SAMPLE_RATE)
         sf.write(str(LAST_RAW_AUDIO_FILE), audio, SAMPLE_RATE)
+
+        # Normalize quiet mics before silence detection. Without this, a mic
+        # whose peak is well below SILENCE_THRESHOLD will have its entire
+        # recording classified as dead air and compressed to nothing.
+        audio, gain = normalize_audio(audio)
+        if gain > 1.0:
+            log(f"Applied {gain:.1f}x gain (mic peak was {float(np.max(np.abs(audio/gain))):.4f})")
 
         # Collapse only genuinely long dead-air gaps (>LONG_PAUSE_TRIGGER) so
         # Whisper doesn't hallucinate over them; normal speech pauses are left

@@ -79,6 +79,24 @@ cutting from the middle so word edges are never clipped.
   were removed. The single-pass conservative approach is intentional — do not
   reintroduce per-pause compression or secondary re-transcription passes.
 
+### Mic gain normalization: `normalize_audio` (WATCH)
+
+Before silence detection and Whisper transcription, `normalize_audio` scales the
+audio up if the peak amplitude is below `NORMALIZE_THRESHOLD` (0.3). Target peak
+after scaling is `NORMALIZE_TARGET` (0.7).
+
+- **Why:** a quiet mic (peak ~0.038, -28 dBFS) has speech RMS well below
+  `SILENCE_THRESHOLD` (0.01), so `compress_silence` classifies 99.6% of a real
+  recording as dead air, triggers `LONG_PAUSE_TRIGGER`, and collapses the entire
+  session to 2 seconds. `normalize_audio` brings the signal to a usable level
+  before either check runs.
+- **What to watch:** normalization amplifies background noise equally with speech.
+  If transcription quality degrades on a noisy-but-quiet mic (hiss becomes
+  prominent), lower `NORMALIZE_TARGET` or add a noise gate. On a clean-but-quiet
+  mic (laptop/headset at max volume) this is a net win.
+- **last-recording-raw.wav** always stores the pre-normalization signal so the
+  true mic level is preserved for diagnostics.
+
 ## Runtime State
 
 All runtime files are in `/tmp/whisper-dictation/`:
