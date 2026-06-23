@@ -77,7 +77,17 @@ pytest, mypy, eslint, webpack, venv, virtualenv, conda,
 """
 
 # Post-processing replacements: {"wrong": "correct"}
-# Add your custom replacements here
+# Add your custom replacements here.
+#
+# Matching is anchored per-side (see apply_replacements) so a key only replaces a
+# whole token, not a fragment inside another word. The anchor chosen for each edge
+# depends on that edge's character, because regex \b only marks a word/non-word
+# transition and therefore can only hinge on a word character:
+#   - word-char edge   (e.g. "jason", "...lint")   -> \b   (blocks "jasonville")
+#   - punctuation edge (e.g. "D.O.S.", "- -help")  -> whitespace/string-edge lookaround
+#   - whitespace edge  (key's own delimiter, e.g. "slash ") -> no anchor; the literal
+#     space already is the boundary and consuming it is intentional.
+# So when adding a key, its leading/trailing character determines how it is bounded.
 REPLACEMENTS = {
     "get commit": "git commit",
     "get push": "git push",
@@ -432,8 +442,19 @@ def remove_segment_overlaps(seg_texts: list) -> list:
 def apply_replacements(text: str) -> str:
     """Apply post-processing replacements to fix common transcription errors."""
     import re
+
+    # Pick the boundary anchor for one edge of a key. See the comment above
+    # REPLACEMENTS for why the choice depends on the edge character.
+    def anchor(ch, side):
+        if ch == '' or ch.isspace():
+            return ''
+        if ch.isalnum() or ch == '_':
+            return r'\b'
+        return r'(?<!\S)' if side == 'L' else r'(?!\S)'
+
     for wrong, correct in REPLACEMENTS.items():
-        text = re.sub(re.escape(wrong), correct, text, flags=re.IGNORECASE)
+        pattern = anchor(wrong[:1], 'L') + re.escape(wrong) + anchor(wrong[-1:], 'R')
+        text = re.sub(pattern, correct, text, flags=re.IGNORECASE)
     return text
 
 
