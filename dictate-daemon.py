@@ -66,6 +66,20 @@ NORMALIZE_TARGET = 0.7     # scale peak up to this value
 # side, so no word edge is ever touched and no click is introduced.
 LONG_PAUSE_TRIGGER = 8.0  # only compress silence runs LONGER than this (seconds)
 LONG_PAUSE_KEEP = 2.0     # collapse such runs down to this many seconds
+
+# Adaptive silence cutoff for batch compression. A FIXED RMS cutoff mis-fires on
+# quiet mics: even after normalization, the quiet onset/tail of a real word can
+# dip below the cutoff, so those windows get absorbed into an adjacent silence
+# run. That over-extends the run past LONG_PAUSE_TRIGGER and lets the middle cut
+# clip real speech (observed: "Roth conversions. You can determine" → "Rothcon.
+# The"). Instead, derive the cutoff from each recording's OWN speech level —
+# SILENCE_REL_FRACTION of a high RMS percentile — so it scales with mic gain.
+# Clamp it so it never rises above the old fixed value (never MORE aggressive than
+# before) and never falls below a small floor (so a near-silent clip, where the
+# percentile lands in noise, still has its genuine dead air collapsed).
+SILENCE_REL_PERCENTILE = 95     # percentile of window RMS taken as the speech level
+SILENCE_REL_FRACTION = 0.08     # silence cutoff = this fraction of that speech level
+SILENCE_THRESHOLD_FLOOR = 0.0025  # cutoff is never clamped below this
 PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
 # Whisper prompt to bias toward technical/programming vocabulary
@@ -253,23 +267,37 @@ def compress_silence(audio: np.ndarray) -> tuple:
     quiet onset/offset, so no speech edge is ever touched and the cut sits in
     truly silent audio (no click).
 
-    Returns (compressed_audio, seconds_removed, compression_events) where each
-    event is {raw_start, raw_end, comp_pos, removed} (seconds): raw_start/raw_end
-    bracket the gap in the original audio, comp_pos is where the shortened gap
-    begins in the compressed audio, and removed is how much silence was dropped.
+    The silence cutoff is adaptive: derived from this recording's own speech level
+    (see SILENCE_REL_* constants) rather than a fixed RMS value, so quiet-mic word
+    edges aren't misclassified as silence and absorbed into a run.
+
+    Returns (compressed_audio, seconds_removed, compression_events, cutoff) where
+    each event is {raw_start, raw_end, comp_pos, removed} (seconds): raw_start/
+    raw_end bracket the gap in the original audio, comp_pos is where the shortened
+    gap begins in the compressed audio, and removed is how much silence was
+    dropped. cutoff is the adaptive RMS threshold used (for logging/diagnostics).
     """
     window = int(0.02 * SAMPLE_RATE)  # 20ms analysis windows
     trigger = int(LONG_PAUSE_TRIGGER * SAMPLE_RATE)
     keep = int(LONG_PAUSE_KEEP * SAMPLE_RATE)
     n_windows = len(audio) // window
     if n_windows == 0:
-        return audio, 0.0, []
+        return audio, 0.0, [], SILENCE_THRESHOLD
 
     rms = np.array([
         np.sqrt(np.mean(audio[i * window:(i + 1) * window] ** 2))
         for i in range(n_windows)
     ])
-    is_silent = rms < SILENCE_THRESHOLD
+    # Adaptive cutoff: a small fraction of the recording's speech level, clamped
+    # so it is never more aggressive than the old fixed cutoff and never collapses
+    # below a floor (which would let mic noise read as speech in a silent clip).
+    speech_level = float(np.percentile(rms, SILENCE_REL_PERCENTILE))
+    cutoff = float(np.clip(
+        speech_level * SILENCE_REL_FRACTION,
+        SILENCE_THRESHOLD_FLOOR,
+        SILENCE_THRESHOLD,
+    ))
+    is_silent = rms < cutoff
 
     kept = []
     compression_events = []
@@ -315,7 +343,7 @@ def compress_silence(audio: np.ndarray) -> tuple:
 
     compressed = np.concatenate(kept) if kept else audio.copy()
     removed = (len(audio) - len(compressed)) / SAMPLE_RATE
-    return compressed, removed, compression_events
+    return compressed, removed, compression_events, cutoff
 
 
 def drop_trailing_high_nsp(segments: list) -> list:
@@ -1596,10 +1624,11 @@ class DictationDaemon:
         # Collapse only genuinely long dead-air gaps (>LONG_PAUSE_TRIGGER) so
         # Whisper doesn't hallucinate over them; normal speech pauses are left
         # untouched (re-timing them degrades transcription).
-        audio_tc, silence_removed, compression_events = compress_silence(audio)
+        audio_tc, silence_removed, compression_events, silence_cutoff = compress_silence(audio)
         if silence_removed > 0.1:
             log(f"Compressed {silence_removed:.1f}s of dead air "
-                f"(gaps >{LONG_PAUSE_TRIGGER:.0f}s collapsed to {LONG_PAUSE_KEEP:.0f}s)")
+                f"(gaps >{LONG_PAUSE_TRIGGER:.0f}s collapsed to {LONG_PAUSE_KEEP:.0f}s, "
+                f"adaptive cutoff {silence_cutoff:.4f})")
             # Map each compressed silence run across both timelines so a "missing
             # speech at Ns" report can be traced in raw vs. compressed audio.
             for ev in compression_events:
