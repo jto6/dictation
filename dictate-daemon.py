@@ -152,7 +152,9 @@ REPLACEMENTS = {
     "CAS": "kas",
     "Piali": "Pyali",
     "Maren": "Marin",
-    "Autosaur": "Autosar"
+    "Autosaur": "Autosar",
+    "RP message": "RPMsg",
+    "Escort": "S-Core"
 }
 
 # Post-processing for batch transcription. Empty list = raw (no rewrite).
