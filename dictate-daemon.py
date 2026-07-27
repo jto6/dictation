@@ -18,6 +18,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import unicodedata
 import json
 import threading
 from queue import Queue, Empty
@@ -236,6 +237,34 @@ POST_CMD_FILE = STATE_DIR / "batch-post-cmd"
 def normalize_whitespace(text: str) -> str:
     """Collapse multiple spaces into single spaces."""
     return re.sub(r' {2,}', ' ', text)
+
+
+# ydotool's `type` looks each character up in a 128-entry keycode table indexed
+# by a *signed* char, so any byte >= 0x80 indexes before the array and emits
+# arbitrary keystrokes. Fold to ASCII first. This applies only to the ydotool
+# path — clipboard and emacsclient inserts handle UTF-8 fine and keep the
+# typographic punctuation that text-clean produces.
+ASCII_PUNCT_MAP = {
+    '‘': "'", '’': "'", '‚': "'", '‛': "'",
+    '“': '"', '”': '"', '„': '"', '‟': '"',
+    '′': "'", '″': '"',
+    '‐': '-', '‑': '-', '‒': '-', '–': '-',
+    '—': '-', '―': '-', '−': '-',
+    '…': '...', '•': '*', ' ': ' ', '⁄': '/',
+}
+_ASCII_PUNCT_TABLE = str.maketrans(ASCII_PUNCT_MAP)
+
+
+def to_ascii(text: str) -> str:
+    """Fold text to pure ASCII so ydotool cannot emit out-of-range keycodes."""
+    text = text.translate(_ASCII_PUNCT_TABLE)
+    if text.isascii():
+        return text
+    # Strip accents (é -> e), then replace anything still outside ASCII so a
+    # dropped character is visible rather than silently corrupting keystrokes.
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = ''.join(c for c in decomposed if not unicodedata.combining(c))
+    return ''.join(c if c.isascii() else '?' for c in stripped)
 
 
 NSP_TRAILING_THRESHOLD = 0.80  # drop trailing segments with no_speech_prob >= this
@@ -845,8 +874,15 @@ def _ydotool_type(text: str):
     ydotool maps \\n (0x0a) to KEY_LINEFEED rather than KEY_ENTER, which
     triggers Ctrl+J in Emacs and other apps. Split on newlines and send
     explicit Enter key (keycode 28) between segments.
+
+    Text is folded to ASCII first; see to_ascii for why.
     """
-    parts = text.split('\n')
+    ascii_text = to_ascii(text)
+    if ascii_text != text:
+        folded = ' '.join(sorted({c for c in text if not c.isascii()}))
+        log(f"ydotool: folded non-ASCII to ASCII: {folded}")
+
+    parts = ascii_text.split('\n')
     for i, part in enumerate(parts):
         if part:
             _run_ydotool(
