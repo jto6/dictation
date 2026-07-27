@@ -823,6 +823,22 @@ def _is_terminal_focused_wayland():
     return False
 
 
+def _run_ydotool(argv: list, timeout: int):
+    """Run a ydotool command, raising with its own diagnostics on failure.
+
+    ydotool prints socket errors to stdout rather than stderr (see
+    Client/ydotool.c), so both streams have to be captured to learn why a
+    call failed — discarding them turns "wrong socket path" into a bare
+    "exit status 2".
+    """
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        detail = ' '.join((proc.stdout + proc.stderr).split()) or "no output"
+        raise RuntimeError(
+            f"{' '.join(argv[:2])} failed (exit {proc.returncode}): {detail}"
+        )
+
+
 def _ydotool_type(text: str):
     """Type text with ydotool, replacing \\n with Enter key events.
 
@@ -833,21 +849,11 @@ def _ydotool_type(text: str):
     parts = text.split('\n')
     for i, part in enumerate(parts):
         if part:
-            subprocess.run(
-                ["ydotool", "type", "--key-delay", "10", "--", part],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=60,
+            _run_ydotool(
+                ["ydotool", "type", "--key-delay", "10", "--", part], timeout=60
             )
         if i < len(parts) - 1:
-            subprocess.run(
-                ["ydotool", "key", "28:1", "28:0"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
+            _run_ydotool(["ydotool", "key", "28:1", "28:0"], timeout=5)
 
 
 def _paste_wayland(text: str):
