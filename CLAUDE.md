@@ -97,6 +97,39 @@ after scaling is `NORMALIZE_TARGET` (0.7).
 - **last-recording-raw.wav** always stores the pre-normalization signal so the
   true mic level is preserved for diagnostics.
 
+### Window-end truncation: batch mode uses `vad_filter=True`
+
+Batch mode transcribes with VAD enabled and deliberately gentle VAD parameters
+(`VAD_THRESHOLD` 0.3, `VAD_SPEECH_PAD_MS` 600, `VAD_MIN_SILENCE_MS` 2000 — all
+less aggressive than faster-whisper's 0.5 / 400ms defaults).
+
+- **Why:** Whisper decodes in 30-second windows. It can truncate a window early —
+  emitting a closing timestamp at the window edge after transcribing only part of
+  it. faster-whisper sees `single_timestamp_ending` and does `seek += segment_size`
+  (`transcribe.py:1071`), consuming the whole window and *skipping* the
+  untranscribed remainder; the word-timestamp seek correction at line 1288 is
+  explicitly bypassed in that branch. Several seconds of real speech vanish with
+  no error, and `avg_logprob` stays excellent (-0.08 observed), so temperature
+  fallback never triggers. Observed twice in one 124s recording: 6s and 13s of
+  speech dropped, both exactly at a window boundary.
+- **Evidence:** re-transcribing the same audio at 8 different window alignments
+  (prepending 0–4.9s of silence), scoring 6 known phrases per run:
+  `vad_filter=False` as shipped scored 37/48; `condition_on_previous_text=False`
+  38/48; dropping the initial prompt 44/48; `vad_filter=True` **48/48** with zero
+  stretched words. The non-VAD variants only ever moved the drop to a different
+  spot — they are alignment luck, not fixes.
+- **Why this does not contradict "don't discard audio":** the old
+  `vad_filter=False` comment assumed VAD would eat real speech. At these settings
+  it only removed genuine >1.5s pauses on the test recording and recovered *more*
+  speech than the non-VAD path. `normalize_audio` already runs first, so VAD sees
+  a healthy signal. If VAD still returns nothing, the daemon logs
+  "VAD returned no speech" and retries with `vad_filter=False`.
+- **How to spot a recurrence:** a truncation leaves the last decoded word
+  stretched across the skipped audio. The daemon logs
+  `WARNING: '<word>' spans ...s - speech was likely dropped here` for any word
+  lasting `LONG_WORD_WARN` (3s) or more. That warning in `daemon.log` is the only
+  trace this failure leaves — a 13.6s "it's" was the fingerprint that found it.
+
 ## Runtime State
 
 All runtime files are in `/tmp/whisper-dictation/`:

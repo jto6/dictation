@@ -83,10 +83,20 @@ SILENCE_REL_FRACTION = 0.08     # silence cutoff = this fraction of that speech 
 SILENCE_THRESHOLD_FLOOR = 0.0025  # cutoff is never clamped below this
 PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
-# Truncation fingerprint. Whisper can skip audio inside a decode window; when it
-# does, the last decoded word is stretched across the skipped span, so an
-# implausibly long word duration is a reliable signal that speech was dropped.
-# Log it rather than fail silently.
+# Batch-mode VAD. Whisper decodes in 30s windows and can truncate a window early,
+# emitting a closing timestamp at the window edge; faster-whisper then treats the
+# window as fully consumed and seeks past the untranscribed remainder, silently
+# dropping seconds of real speech (see "Window-end truncation" in CLAUDE.md).
+# Feeding it VAD-trimmed speech keeps that from happening. These settings are
+# deliberately LESS aggressive than faster-whisper's defaults (threshold 0.5,
+# pad 400ms) so a quiet or breathy word is never mistaken for silence.
+VAD_THRESHOLD = 0.3          # speech probability above this counts as speech
+VAD_SPEECH_PAD_MS = 600      # keep this much audio either side of each speech run
+VAD_MIN_SILENCE_MS = 2000    # only break a speech run after this much silence
+
+# Truncation fingerprint. A window-end truncation leaves the last decoded word
+# stretched across the skipped audio, so an implausibly long word duration is a
+# reliable signal that speech was dropped. Log it rather than fail silently.
 LONG_WORD_WARN = 3.0  # seconds; no real single word lasts this long
 
 # Whisper prompt to bias toward technical/programming vocabulary
@@ -1700,15 +1710,31 @@ class DictationDaemon:
 
         try:
             start = time.time()
-            segments, _ = self._transcribe_with_cpu_fallback(
-                AUDIO_FILE,
+            transcribe_opts = dict(
                 beam_size=5,
                 language="en",
-                vad_filter=False,  # Don't discard any audio - user intentionally started recording
                 initial_prompt=INITIAL_PROMPT,
                 word_timestamps=True,  # Prevents skipping speech in long segments
                 hallucination_silence_threshold=None,  # Disabled: was dropping real speech after pauses
             )
+            segments, _ = self._transcribe_with_cpu_fallback(
+                AUDIO_FILE,
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=VAD_THRESHOLD,
+                    speech_pad_ms=VAD_SPEECH_PAD_MS,
+                    min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+                ),
+                **transcribe_opts,
+            )
+            # The user intentionally started recording, so an empty result means
+            # VAD misjudged the audio (very quiet or noisy mic), not that nothing
+            # was said. Fall back to decoding the untrimmed audio.
+            if not any(seg.text.strip() for seg in segments):
+                log("VAD returned no speech, retrying without it")
+                segments, _ = self._transcribe_with_cpu_fallback(
+                    AUDIO_FILE, vad_filter=False, **transcribe_opts
+                )
             if segments:
                 log(f"Segments: {len(segments)}, last ends at {segments[-1].end:.1f}s (audio: {duration:.1f}s)")
                 prev_end = 0.0
@@ -1720,8 +1746,8 @@ class DictationDaemon:
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
                 # A word stretched over several seconds means the decoder skipped
-                # the audio underneath it - speech was dropped. Surface it; the
-                # log is the only trace it leaves.
+                # the audio underneath it (window-end truncation) - speech was
+                # dropped. Surface it; the log is the only trace it leaves.
                 for seg in segments:
                     for w in (getattr(seg, 'words', None) or []):
                         if w.end - w.start >= LONG_WORD_WARN:
