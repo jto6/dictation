@@ -83,6 +83,12 @@ SILENCE_REL_FRACTION = 0.08     # silence cutoff = this fraction of that speech 
 SILENCE_THRESHOLD_FLOOR = 0.0025  # cutoff is never clamped below this
 PAUSE_PUNCTUATION_THRESHOLD = 1.5  # Silence longer than this = intentional pause, strip punctuation
 
+# Truncation fingerprint. Whisper can skip audio inside a decode window; when it
+# does, the last decoded word is stretched across the skipped span, so an
+# implausibly long word duration is a reliable signal that speech was dropped.
+# Log it rather than fail silently.
+LONG_WORD_WARN = 3.0  # seconds; no real single word lasts this long
+
 # Whisper prompt to bias toward technical/programming vocabulary
 INITIAL_PROMPT = """
 git commit --message, git push, git pull, git checkout, git branch,
@@ -1713,6 +1719,15 @@ class DictationDaemon:
                     nsp_flag = f" [nsp={nsp:.2f}]" if nsp is not None else ""
                     log(f"  seg {i}: {seg.start:.1f}-{seg.end:.1f}s{gap_flag}{nsp_flag} {seg.text.strip()[:80]}")
                     prev_end = seg.end
+                # A word stretched over several seconds means the decoder skipped
+                # the audio underneath it - speech was dropped. Surface it; the
+                # log is the only trace it leaves.
+                for seg in segments:
+                    for w in (getattr(seg, 'words', None) or []):
+                        if w.end - w.start >= LONG_WORD_WARN:
+                            log(f"  WARNING: '{w.word.strip()}' spans "
+                                f"{w.start:.1f}-{w.end:.1f}s ({w.end - w.start:.1f}s) - "
+                                f"speech was likely dropped here")
             # Drop segments where word rate is physically impossible (Whisper hallucination).
             # Normal max speech is ~5 words/sec; hallucinated filler appears at 8-15 words/sec.
             # Only apply to segments with >=3 words to avoid false positives on short real utterances.
