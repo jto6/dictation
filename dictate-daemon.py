@@ -1785,6 +1785,7 @@ class DictationDaemon:
                 log(f"Transcribed in {elapsed:.2f}s: {text}")
             log(f"Raw transcript: {text}")
             text = self._run_post_processor(text)
+            text = text.rstrip('\n')
         except Exception as e:
             log(f"Transcription error: {e}")
             text = ""
