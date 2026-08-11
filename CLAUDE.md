@@ -130,6 +130,25 @@ less aggressive than faster-whisper's 0.5 / 400ms defaults).
   lasting `LONG_WORD_WARN` (3s) or more. That warning in `daemon.log` is the only
   trace this failure leaves — a 13.6s "it's" was the fingerprint that found it.
 
+### ydotool 0.x vs 1.x `key` syntax
+
+`ydotool key` changed syntax at 1.0: 1.x takes `keycode:state` pairs (`29:1`
+presses left ctrl), 0.x takes key-name sequences (`ctrl+shift+v`). The daemon
+detects which one is installed (`ydotool_key_syntax`, from `ydotool key --help`)
+and builds arguments to match via `_ydotool_combo`.
+
+- **Why:** ydotool 0.1.8 (what Ubuntu 24.04 ships) does not reject a `29:0`
+  argument. Its key-name lookup misses and it falls back to the argument's
+  first character, so `reset_modifier_keys` typed **`24511`** — the leading
+  digits of 29, 42, 56, 125, 126 — at the cursor after every dictation. Silent,
+  exit status 0, nothing in the log.
+- **Modifier reset is skipped on 0.x:** that version cannot send a release
+  without a press, so `key ctrl` would *tap* ctrl. Leaving a stuck modifier
+  alone is the lesser evil.
+- **What to watch:** any new `ydotool key` call must go through
+  `_ydotool_combo` and add its key to `YDOTOOL_KEYS`. `ydotool type` is
+  unaffected — its syntax is the same in both versions.
+
 ## Runtime State
 
 All runtime files are in `/tmp/whisper-dictation/`:

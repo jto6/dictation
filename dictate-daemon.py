@@ -631,11 +631,62 @@ def play_sound(sound_name: str):
 PASTE_CHUNK_SIZE = 300
 
 
+# ydotool 1.0 changed the `key` syntax: 1.x takes `keycode:state` pairs
+# ("29:1" presses left ctrl), 0.x takes key-name sequences ("ctrl+shift+v").
+# Handing 0.x an argument like "29:0" does not fail — the name lookup misses
+# and it falls back to the argument's first character, so the modifier reset
+# typed "24511" (the leading digits of 29, 42, 56, 125, 126) at the cursor
+# after every dictation. Detect the syntax rather than assuming 1.x.
+YDOTOOL_KEYS = {
+    # name: (1.x keycode, 0.x key name)
+    "enter": (28, "enter"),
+    "ctrl":  (29, "ctrl"),
+    "shift": (42, "shift"),
+    "v":     (47, "v"),
+}
+
+_ydotool_syntax: str | None = None
+
+
+def ydotool_key_syntax() -> str:
+    """Return "keycode" for ydotool >= 1.0, "name" for ydotool 0.x."""
+    global _ydotool_syntax
+    if _ydotool_syntax is None:
+        syntax = "keycode"
+        try:
+            proc = subprocess.run(
+                ["ydotool", "key", "--help"],
+                capture_output=True, text=True, timeout=5,
+            )
+            help_text = (proc.stdout + proc.stderr).lower()
+            if "keycode" not in help_text and "separated by plus" in help_text:
+                syntax = "name"
+        except Exception:
+            pass  # keep the modern default
+        log(f"ydotool key syntax: {syntax}")
+        _ydotool_syntax = syntax
+    return _ydotool_syntax
+
+
+def _ydotool_combo(*keys: str) -> list:
+    """argv tapping `keys` together, in whichever syntax this ydotool speaks."""
+    if ydotool_key_syntax() == "keycode":
+        codes = [YDOTOOL_KEYS[k][0] for k in keys]
+        args = [f"{c}:1" for c in codes] + [f"{c}:0" for c in reversed(codes)]
+    else:
+        args = ["+".join(YDOTOOL_KEYS[k][1] for k in keys)]
+    return ["ydotool", "key", *args]
+
+
 def reset_modifier_keys():
     """Reset modifier keys to prevent stuck Ctrl/Alt/Shift states."""
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
     try:
         if session_type == "wayland":
+            if ydotool_key_syntax() != "keycode":
+                # ydotool 0.x has no release-without-press: `key ctrl` taps the
+                # modifier, which is worse than leaving a stuck one alone.
+                return
             # Release all modifiers via ydotool
             # 29=ctrl, 42=shift, 56=alt, 125=Super_L, 126=Super_R
             subprocess.run(
@@ -905,7 +956,7 @@ def _ydotool_type(text: str):
                 ["ydotool", "type", "--key-delay", "10", "--", part], timeout=60
             )
         if i < len(parts) - 1:
-            _run_ydotool(["ydotool", "key", "28:1", "28:0"], timeout=5)
+            _run_ydotool(_ydotool_combo("enter"), timeout=5)
 
 
 def _paste_wayland(text: str):
@@ -943,7 +994,7 @@ def _paste_wayland(text: str):
 
             # Paste with Ctrl+Shift+V
             subprocess.run(
-                ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+                _ydotool_combo("ctrl", "shift", "v"),
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
             )
             log("paste: Ctrl+Shift+V sent")
