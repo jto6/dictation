@@ -872,9 +872,58 @@ TERMINAL_APP_IDS = {
 }
 
 
+# Focused-window probe for GNOME Wayland, served by the bundled shell extension
+# (gnome-extension/dictation-focus@local). GNOME exposes focus nowhere else:
+# XWayland never sets _NET_ACTIVE_WINDOW, so `xdotool getactivewindow` always
+# fails, and org.gnome.Shell.Introspect.GetWindows / GetRunningApplications /
+# Eval are all access-denied. Without the extension every window looks like a
+# non-terminal and long dictations get typed keystroke-by-keystroke.
+GNOME_FOCUS_BUS = "org.local.DictationFocus"
+GNOME_FOCUS_PATH = "/org/local/DictationFocus"
+
+_gnome_focus_warned = False
+
+
+def _focused_wm_class_gnome() -> str | None:
+    """Focused window's WM_CLASS via the shell extension, or None if unavailable.
+
+    None means "don't know" (not GNOME, extension missing, disabled by a GNOME
+    upgrade) and callers fall through to the other detection paths.
+    """
+    global _gnome_focus_warned
+    if "gnome" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+        return None
+    try:
+        proc = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", GNOME_FOCUS_BUS,
+             "--object-path", GNOME_FOCUS_PATH,
+             "--method", f"{GNOME_FOCUS_BUS}.GetFocused"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception as e:
+        proc = None
+        detail = str(e)
+    else:
+        detail = ' '.join((proc.stdout + proc.stderr).split())
+    if proc is None or proc.returncode != 0:
+        if not _gnome_focus_warned:
+            _gnome_focus_warned = True
+            log(f"GNOME focus probe unavailable ({detail[:160]}); "
+                f"enable the dictation-focus@local extension for terminal detection")
+        return None
+    m = re.match(r"\('(.*)',\)$", proc.stdout.strip())
+    return m.group(1).lower() if m else None
+
+
 def _is_terminal_focused_wayland():
     """Check if the focused Wayland window is a terminal emulator."""
     import re as _re
+
+    # --- GNOME: bundled shell extension ---
+    wm_class = _focused_wm_class_gnome()
+    if wm_class is not None:
+        log(f"paste: focused window class {wm_class!r}")
+        return any(c in TERMINAL_APP_IDS for c in wm_class.split())
 
     # --- Sway ---
     try:

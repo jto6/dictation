@@ -1,0 +1,8 @@
+{
+  "uuid": "dictation-focus@local",
+  "name": "Dictation Focus",
+  "description": "Exports the focused window's WM_CLASS on the session bus so the whisper dictation daemon can tell terminals from other apps. GNOME Wayland exposes this nowhere else.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "session-modes": ["user"],
+  "version": 1
+}

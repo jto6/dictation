@@ -216,6 +216,28 @@ else
     update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
 fi
 
+# GNOME Wayland: install the focused-window extension.
+# GNOME exposes focus to no other client (XWayland never sets _NET_ACTIVE_WINDOW,
+# Shell's Introspect/Eval are access-denied), so without this the daemon cannot
+# tell a terminal from any other app and falls back to simulated typing.
+EXT_UUID="dictation-focus@local"
+if [[ "$SESSION_TYPE" == "wayland" && "$XDG_CURRENT_DESKTOP" == *"GNOME"* ]]; then
+    echo ""
+    echo "GNOME Wayland detected - installing focused-window extension..."
+    EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+    mkdir -p "$EXT_DIR"
+    cp "gnome-extension/$EXT_UUID/metadata.json" "gnome-extension/$EXT_UUID/extension.js" "$EXT_DIR/"
+    if gnome-extensions enable "$EXT_UUID" 2>/dev/null; then
+        echo "✓ Extension enabled"
+    else
+        echo "  Extension files installed to $EXT_DIR"
+        echo "  GNOME Shell only picks up new extensions at login, and it cannot"
+        echo "  be restarted on Wayland. Log out and back in, then run:"
+        echo "    gnome-extensions enable $EXT_UUID"
+        echo "  Until then dictation still works, using simulated typing."
+    fi
+fi
+
 # Restart daemon if running (to pick up updates)
 if [ -f "/tmp/whisper-dictation/daemon.pid" ]; then
     echo ""

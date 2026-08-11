@@ -130,6 +130,37 @@ less aggressive than faster-whisper's 0.5 / 400ms defaults).
   lasting `LONG_WORD_WARN` (3s) or more. That warning in `daemon.log` is the only
   trace this failure leaves — a 13.6s "it's" was the fingerprint that found it.
 
+### Focused-window detection on GNOME Wayland needs the bundled extension
+
+`gnome-extension/dictation-focus@local/` is a ~40-line GNOME Shell extension
+that exports the focused window's WM_CLASS on the session bus
+(`org.local.DictationFocus.GetFocused`). `_focused_wm_class_gnome` in the daemon
+queries it; `_is_terminal_focused_wayland` tries it before the Sway and xdotool
+paths.
+
+- **Why:** GNOME Wayland exposes the focused window to no normal client.
+  XWayland never sets `_NET_ACTIVE_WINDOW` (so `xdotool getactivewindow` fails
+  for *every* window, not just Wayland-native ones),
+  `org.gnome.Shell.Introspect.GetWindows` and `GetRunningApplications` return
+  `AccessDenied`, `org.gnome.Shell.Eval` returns `(false, '')` since GNOME 41,
+  Mutter implements no wlr-foreign-toplevel protocol, and AT-SPI is off by
+  default. Extension code runs inside gnome-shell, so it can just read
+  `global.display.focus_window`.
+- **What it fixes:** without it every app looked like a non-terminal, so
+  terminals got `ydotool type` instead of clipboard paste — risking dropped
+  characters on long dictations, and turning each `\n` into a real Enter that
+  *executes* the line at a shell prompt.
+- **Installation is login-gated:** GNOME Shell only scans for new extensions at
+  login and cannot be restarted on Wayland (`ReloadExtension` is deprecated and
+  errors). After `install.sh` copies it, log out and back in, then
+  `gnome-extensions enable dictation-focus@local`.
+- **Degradation is silent by design:** the probe returns None when the
+  extension is missing or a GNOME upgrade disabled it (`shell-version` in
+  `metadata.json` — bump it after a major upgrade), and the daemon falls back to
+  its previous behavior after logging the reason once.
+- **Keep it tiny:** it runs in the gnome-shell process, where a fault takes down
+  the whole session. One method, one property read, no signals, no timers.
+
 ### ydotool 0.x vs 1.x `key` syntax
 
 `ydotool key` changed syntax at 1.0: 1.x takes `keycode:state` pairs (`29:1`
