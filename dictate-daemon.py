@@ -171,7 +171,8 @@ REPLACEMENTS = {
     "Maren": "Marin",
     "Autosaur": "Autosar",
     "RP message": "RPMsg",
-    "Escort": "S-Core"
+    "Escort": "S-Core",
+    "Renaissance": "Renesas"
 }
 
 # Post-processing for batch transcription. Empty list = raw (no rewrite).
